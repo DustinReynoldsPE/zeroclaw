@@ -44,7 +44,12 @@ const DEFAULT_CLAUDE_CODE_BINARY: &str = "claude";
 /// Model name used to signal "use the provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
 /// Claude Code requests are bounded to avoid hung subprocesses.
-const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// 30 minutes allows complex multi-tool workflows (code generation,
+/// web research, file operations) to complete without premature termination.
+const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
+/// Shorter timeout for `--resume` attempts; stale sessions should fail fast
+/// rather than burning the full request timeout before retrying fresh.
+const CLAUDE_CODE_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Avoid leaking oversized stderr payloads.
 const MAX_CLAUDE_CODE_STDERR_CHARS: usize = 512;
 /// The CLI does not support sampling controls; allow only baseline defaults.
@@ -199,8 +204,16 @@ impl ClaudeCodeProvider {
         // Look up existing session for --resume.
         let resume_id = session_key.as_ref().and_then(|k| self.get_session(k));
 
+        // Use a shorter timeout for --resume attempts so stale sessions
+        // fail fast instead of burning the full 300s request timeout.
+        let resume_timeout = if resume_id.is_some() {
+            CLAUDE_CODE_RESUME_TIMEOUT
+        } else {
+            CLAUDE_CODE_REQUEST_TIMEOUT
+        };
+
         let result = self
-            .invoke_cli_inner(message, model, cwd.as_ref(), resume_id.as_deref())
+            .invoke_cli_inner(message, model, cwd.as_ref(), resume_id.as_deref(), resume_timeout)
             .await;
 
         // If --resume failed, clear stale session and retry without it.
@@ -213,7 +226,7 @@ impl ClaudeCodeProvider {
                 self.clear_session(key);
             }
             return self
-                .invoke_cli_inner(message, model, cwd.as_ref(), None)
+                .invoke_cli_inner(message, model, cwd.as_ref(), None, CLAUDE_CODE_REQUEST_TIMEOUT)
                 .await;
         }
 
@@ -227,6 +240,7 @@ impl ClaudeCodeProvider {
         model: &str,
         cwd: Option<&PathBuf>,
         resume_session_id: Option<&str>,
+        request_timeout: Duration,
     ) -> anyhow::Result<String> {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--print");
@@ -272,12 +286,12 @@ impl ClaudeCodeProvider {
             })?;
         }
 
-        let output = timeout(CLAUDE_CODE_REQUEST_TIMEOUT, child.wait_with_output())
+        let output = timeout(request_timeout, child.wait_with_output())
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
                     "Claude Code request timed out after {:?} (binary: {})",
-                    CLAUDE_CODE_REQUEST_TIMEOUT,
+                    request_timeout,
                     self.binary_path.display()
                 )
             })?
