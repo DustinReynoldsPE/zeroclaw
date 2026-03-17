@@ -7494,6 +7494,8 @@ default_temperature = 0.7
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: 0.5,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
@@ -7864,6 +7866,8 @@ tool_dispatcher = "xml"
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: 0.9,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
@@ -9231,6 +9235,8 @@ requires_openai_auth = true
             default_model: Some("glm-5:cloud".to_string()),
             api_url: None,
             api_key: Some("ollama-key".to_string()),
+            channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 
@@ -9248,6 +9254,8 @@ requires_openai_auth = true
             default_model: Some("glm-5:cloud".to_string()),
             api_url: Some("https://ollama.com/api".to_string()),
             api_key: None,
+            channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 
@@ -9276,6 +9284,8 @@ requires_openai_auth = true
                     api_path: None,
                 },
             )]),
+            channel_workspaces: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 
