@@ -366,8 +366,10 @@ impl Provider for ClaudeCodeProvider {
             _ => message.to_string(),
         };
 
-        // Extract session key before invoke (it's in the system prompt prefix).
-        let (session_key, _) = Self::extract_session_key(&full_message);
+        // Extract session key before invoke. CWD directive comes first,
+        // so strip it before looking for the session key.
+        let (_, after_cwd) = Self::extract_cwd(&full_message);
+        let (session_key, _) = Self::extract_session_key(after_cwd);
 
         let mut result = self.invoke_cli(&full_message, model).await?;
         self.store_session_from_response(&mut result, session_key.as_deref());
