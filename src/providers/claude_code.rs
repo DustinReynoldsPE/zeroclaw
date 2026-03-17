@@ -1,25 +1,15 @@
-//! Claude Code headless CLI provider with session persistence.
+//! Claude Code headless CLI provider with streaming and session persistence.
 //!
-//! Integrates with the Claude Code CLI, spawning the `claude` binary
-//! as a subprocess for each inference request. Sessions are persisted
-//! via `--resume` so that multi-turn conversations retain full tool
-//! results, file context, and conversation history within Claude Code.
-//!
-//! # Usage
-//!
-//! The `claude` binary must be available in `PATH`, or its location must be
-//! set via the `CLAUDE_CODE_PATH` environment variable.
+//! Integrates with the Claude Code CLI via `--output-format stream-json`,
+//! reading events as they arrive. Tool calls are tracked for progress display,
+//! sessions are persisted via `--resume`, and each response includes a status
+//! line with session ID and context usage.
 //!
 //! # Directives
 //!
 //! The provider recognizes special directives prepended to the message:
 //! - `[ZEROCLAW_CWD:/path]` — run Claude Code in the given working directory
 //! - `[ZEROCLAW_SESSION_KEY:key]` — persist/resume sessions keyed by this identifier
-//!
-//! # Authentication
-//!
-//! Authentication is handled by Claude Code itself (its own credential store).
-//! No explicit API key is required by this provider.
 //!
 //! # Environment variables
 //!
@@ -29,11 +19,12 @@ use crate::providers::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::Duration;
 
 /// Environment variable for overriding the path to the `claude` binary.
 pub const CLAUDE_CODE_PATH_ENV: &str = "CLAUDE_CODE_PATH";
@@ -43,35 +34,34 @@ const DEFAULT_CLAUDE_CODE_BINARY: &str = "claude";
 
 /// Model name used to signal "use the provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
-/// Claude Code requests are bounded to avoid hung subprocesses.
-/// 30 minutes allows complex multi-tool workflows (code generation,
-/// web research, file operations) to complete without premature termination.
+/// 30 minutes allows complex multi-tool workflows to complete.
 const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(1800);
-/// Shorter timeout for `--resume` attempts; stale sessions should fail fast
-/// rather than burning the full request timeout before retrying fresh.
+/// Stale sessions should fail fast rather than burning the full timeout.
 const CLAUDE_CODE_RESUME_TIMEOUT: Duration = Duration::from_secs(30);
 /// Avoid leaking oversized stderr payloads.
 const MAX_CLAUDE_CODE_STDERR_CHARS: usize = 512;
-/// The CLI does not support sampling controls; allow only baseline defaults.
 const CLAUDE_CODE_SUPPORTED_TEMPERATURES: [f64; 2] = [0.7, 1.0];
 const TEMP_EPSILON: f64 = 1e-9;
 
-/// Parsed JSON output from `claude --print --output-format json`.
-#[derive(Debug, Deserialize)]
-struct ClaudeJsonOutput {
-    /// The assistant's response text.
-    result: Option<String>,
-    /// Session ID for resuming this conversation.
+/// Collected metadata from a stream-json session.
+#[derive(Debug, Default)]
+struct StreamResult {
+    result_text: String,
     session_id: Option<String>,
-    /// Whether the result represents an error.
-    #[serde(default)]
     is_error: bool,
+    tool_calls: Vec<String>,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cost_usd: f64,
+    duration_ms: u64,
+    num_turns: u64,
 }
 
 /// Provider that invokes the Claude Code CLI as a subprocess.
 ///
-/// Sessions are tracked internally so that subsequent calls with the same
-/// session key automatically resume the prior Claude Code conversation.
+/// Uses `--output-format stream-json` to read events as they arrive,
+/// tracking tool calls and session IDs for persistent conversations.
 pub struct ClaudeCodeProvider {
     /// Path to the `claude` binary.
     binary_path: PathBuf,
@@ -80,10 +70,6 @@ pub struct ClaudeCodeProvider {
 }
 
 impl ClaudeCodeProvider {
-    /// Create a new `ClaudeCodeProvider`.
-    ///
-    /// The binary path is resolved from `CLAUDE_CODE_PATH` env var if set,
-    /// otherwise defaults to `"claude"` (found via `PATH`).
     pub fn new() -> Self {
         let binary_path = std::env::var(CLAUDE_CODE_PATH_ENV)
             .ok()
@@ -97,25 +83,15 @@ impl ClaudeCodeProvider {
         }
     }
 
-    /// Returns true if the model argument should be forwarded to the CLI.
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
         !trimmed.is_empty() && trimmed != DEFAULT_MODEL_MARKER
-    }
-
-    fn supports_temperature(temperature: f64) -> bool {
-        CLAUDE_CODE_SUPPORTED_TEMPERATURES
-            .iter()
-            .any(|v| (temperature - v).abs() < TEMP_EPSILON)
     }
 
     fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
         if !temperature.is_finite() {
             anyhow::bail!("Claude Code provider received non-finite temperature value");
         }
-        // Claude Code CLI only supports 0.7 and 1.0, but we silently clamp
-        // unsupported values to 1.0 rather than failing, since ZeroClaw's
-        // query classifier may request temperatures the CLI cannot honor.
         Ok(())
     }
 
@@ -132,8 +108,6 @@ impl ClaudeCodeProvider {
         format!("{clipped}...")
     }
 
-    /// Extract a `[ZEROCLAW_CWD:/path]` directive from the message, returning
-    /// the working directory and the message with the directive stripped.
     fn extract_cwd(message: &str) -> (Option<PathBuf>, &str) {
         if let Some(rest) = message.strip_prefix("[ZEROCLAW_CWD:") {
             if let Some(end) = rest.find(']') {
@@ -147,8 +121,6 @@ impl ClaudeCodeProvider {
         (None, message)
     }
 
-    /// Extract a `[ZEROCLAW_SESSION_KEY:key]` directive from the message,
-    /// returning the session key and the message with the directive stripped.
     fn extract_session_key(message: &str) -> (Option<String>, &str) {
         if let Some(rest) = message.strip_prefix("[ZEROCLAW_SESSION_KEY:") {
             if let Some(end) = rest.find(']') {
@@ -162,50 +134,179 @@ impl ClaudeCodeProvider {
         (None, message)
     }
 
-    /// Look up a stored session ID for the given key.
     fn get_session(&self, key: &str) -> Option<String> {
         self.sessions.lock().ok()?.get(key).cloned()
     }
 
-    /// Store a session ID for the given key.
     fn set_session(&self, key: String, session_id: String) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.insert(key, session_id);
         }
     }
 
-    /// Remove a stored session (e.g. after a resume failure).
     fn clear_session(&self, key: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(key);
         }
     }
 
-    /// Parse JSON output from `claude --print --output-format json`.
-    /// Falls back to treating stdout as plain text if JSON parsing fails.
-    fn parse_output(stdout: &str) -> (String, Option<String>) {
-        let trimmed = stdout.trim();
-        if let Ok(parsed) = serde_json::from_str::<ClaudeJsonOutput>(trimmed) {
-            let text = parsed.result.unwrap_or_default();
-            (text, parsed.session_id)
-        } else {
-            // Fallback: raw text output (e.g. older CLI without --output-format)
-            (trimmed.to_string(), None)
+    /// Parse a single stream-json event line and update the result accumulator.
+    fn process_stream_event(line: &str, result: &mut StreamResult) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            return;
+        };
+
+        match event.get("type").and_then(|t| t.as_str()) {
+            Some("result") => {
+                result.result_text = event
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                result.session_id = event
+                    .get("session_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from);
+                result.is_error = event
+                    .get("is_error")
+                    .and_then(|e| e.as_bool())
+                    .unwrap_or(false);
+                result.cost_usd = event
+                    .get("total_cost_usd")
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+                result.duration_ms = event
+                    .get("duration_ms")
+                    .and_then(|d| d.as_u64())
+                    .unwrap_or(0);
+                result.num_turns = event
+                    .get("num_turns")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(0);
+
+                if let Some(usage) = event.get("usage") {
+                    result.input_tokens = usage
+                        .get("input_tokens")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    result.output_tokens = usage
+                        .get("output_tokens")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    result.cache_read_tokens = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                }
+            }
+            Some("assistant") => {
+                // Extract tool_use calls for progress tracking.
+                if let Some(content) = event
+                    .pointer("/message/content")
+                    .and_then(|c| c.as_array())
+                {
+                    for item in content {
+                        if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                                result.tool_calls.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
-    /// Invoke the claude binary with the given prompt and optional model.
-    /// Returns the trimmed stdout output as the assistant response.
+    /// Format a human-readable token count (e.g. "45.2k").
+    fn format_tokens(tokens: u64) -> String {
+        if tokens >= 1_000_000 {
+            format!("{:.1}M", tokens as f64 / 1_000_000.0)
+        } else if tokens >= 1_000 {
+            format!("{:.1}k", tokens as f64 / 1_000.0)
+        } else {
+            tokens.to_string()
+        }
+    }
+
+    /// Build a status line from the stream result metadata.
+    fn build_status_line(result: &StreamResult) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(ref sid) = result.session_id {
+            let short = if sid.len() > 8 { &sid[..8] } else { sid };
+            parts.push(format!("session {short}"));
+        }
+
+        let total_tokens = result.input_tokens + result.output_tokens;
+        if total_tokens > 0 {
+            parts.push(format!(
+                "{}in + {}out",
+                Self::format_tokens(result.input_tokens),
+                Self::format_tokens(result.output_tokens),
+            ));
+            if result.cache_read_tokens > 0 {
+                parts.push(format!("{}cached", Self::format_tokens(result.cache_read_tokens)));
+            }
+        }
+
+        if result.cost_usd > 0.0 {
+            parts.push(format!("${:.4}", result.cost_usd));
+        }
+
+        if result.duration_ms > 0 {
+            let secs = result.duration_ms as f64 / 1000.0;
+            parts.push(format!("{secs:.1}s"));
+        }
+
+        if !result.tool_calls.is_empty() {
+            parts.push(format!("{} tool calls", result.tool_calls.len()));
+        }
+
+        if parts.is_empty() {
+            return String::new();
+        }
+
+        format!("\n\n---\n`{}`", parts.join(" | "))
+    }
+
+    /// Build a progress summary of tool calls made during the session.
+    fn build_progress_summary(tool_calls: &[String]) -> String {
+        if tool_calls.is_empty() {
+            return String::new();
+        }
+
+        // Deduplicate and count.
+        let mut counts: Vec<(String, usize)> = Vec::new();
+        for name in tool_calls {
+            if let Some(entry) = counts.iter_mut().find(|(n, _)| n == name) {
+                entry.1 += 1;
+            } else {
+                counts.push((name.clone(), 1));
+            }
+        }
+
+        let mut summary = String::from("**Tools used:** ");
+        for (i, (name, count)) in counts.iter().enumerate() {
+            if i > 0 {
+                summary.push_str(", ");
+            }
+            if *count > 1 {
+                write!(summary, "{name} x{count}").ok();
+            } else {
+                summary.push_str(name);
+            }
+        }
+        summary.push_str("\n\n");
+        summary
+    }
+
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
-        // Extract directives from the message prefix.
         let (cwd, message) = Self::extract_cwd(message);
         let (session_key, message) = Self::extract_session_key(message);
 
-        // Look up existing session for --resume.
         let resume_id = session_key.as_ref().and_then(|k| self.get_session(k));
 
-        // Use a shorter timeout for --resume attempts so stale sessions
-        // fail fast instead of burning the full 300s request timeout.
         let resume_timeout = if resume_id.is_some() {
             CLAUDE_CODE_RESUME_TIMEOUT
         } else {
@@ -225,15 +326,38 @@ impl ClaudeCodeProvider {
                 );
                 self.clear_session(key);
             }
-            return self
+            let fresh = self
                 .invoke_cli_inner(message, model, cwd.as_ref(), None, CLAUDE_CODE_REQUEST_TIMEOUT)
-                .await;
+                .await?;
+            return Ok(self.finalize_response(fresh, session_key.as_deref()));
         }
 
-        result
+        Ok(self.finalize_response(result?, session_key.as_deref()))
     }
 
-    /// Inner CLI invocation with explicit resume control.
+    /// Store session ID from the result and return the formatted response.
+    fn finalize_response(&self, encoded: String, session_key: Option<&str>) -> String {
+        // The encoded response may have [ZEROCLAW_NEW_SESSION:id] prefix.
+        let mut response = encoded;
+        if let Some(rest) = response.strip_prefix("[ZEROCLAW_NEW_SESSION:") {
+            if let Some(end) = rest.find(']') {
+                let new_id = rest[..end].trim().to_string();
+                let remainder = rest[end + 1..].trim_start_matches('\n').to_string();
+                if let Some(key) = session_key {
+                    tracing::info!(
+                        session_key = key,
+                        session_id = new_id.as_str(),
+                        "Claude Code session persisted for --resume"
+                    );
+                    self.set_session(key.to_string(), new_id);
+                }
+                response = remainder;
+            }
+        }
+        response
+    }
+
+    /// Inner CLI invocation using stream-json for real-time event processing.
     async fn invoke_cli_inner(
         &self,
         message: &str,
@@ -245,7 +369,7 @@ impl ClaudeCodeProvider {
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--print");
         cmd.arg("--dangerously-skip-permissions");
-        cmd.arg("--output-format").arg("json");
+        cmd.arg("--output-format").arg("stream-json");
 
         if let Some(session_id) = resume_session_id {
             cmd.arg("--resume").arg(session_id);
@@ -259,7 +383,6 @@ impl ClaudeCodeProvider {
             cmd.arg("--model").arg(model);
         }
 
-        // Read prompt from stdin to avoid exposing sensitive content in process args.
         cmd.arg("-");
         cmd.kill_on_drop(true);
         cmd.stdin(std::process::Stdio::piped());
@@ -274,6 +397,7 @@ impl ClaudeCodeProvider {
             )
         })?;
 
+        // Write prompt to stdin.
         if let Some(mut stdin) = child.stdin.take() {
             stdin
                 .write_all(message.as_bytes())
@@ -286,72 +410,101 @@ impl ClaudeCodeProvider {
             })?;
         }
 
-        let output = timeout(request_timeout, child.wait_with_output())
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Claude Code request timed out after {:?} (binary: {})",
-                    request_timeout,
-                    self.binary_path.display()
-                )
-            })?
-            .map_err(|err| anyhow::anyhow!("Claude Code process failed: {err}"))?;
+        // Read stdout line-by-line as stream-json events arrive.
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Claude Code process has no stdout handle"))?;
+        let mut reader = BufReader::new(stdout).lines();
+        let mut stream = StreamResult::default();
+        let deadline = tokio::time::Instant::now() + request_timeout;
 
-        if !output.status.success() {
-            let code = output.status.code().unwrap_or(-1);
-            let stderr_excerpt = Self::redact_stderr(&output.stderr);
+        loop {
+            let line = tokio::select! {
+                line = reader.next_line() => {
+                    line.map_err(|err| anyhow::anyhow!("Error reading Claude Code stdout: {err}"))?
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    child.kill().await.ok();
+                    anyhow::bail!(
+                        "Claude Code request timed out after {:?} (binary: {})",
+                        request_timeout,
+                        self.binary_path.display()
+                    );
+                }
+            };
+
+            let Some(line) = line else {
+                break; // EOF — process exited.
+            };
+
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            Self::process_stream_event(trimmed, &mut stream);
+        }
+
+        // Wait for process to fully exit and check status.
+        let status = child.wait().await.map_err(|err| {
+            anyhow::anyhow!("Failed to wait for Claude Code process: {err}")
+        })?;
+
+        if !status.success() && stream.result_text.is_empty() {
+            // Read stderr for diagnostics.
+            let stderr = if let Some(mut stderr_handle) = child.stderr.take() {
+                let mut buf = Vec::new();
+                tokio::io::AsyncReadExt::read_to_end(&mut stderr_handle, &mut buf)
+                    .await
+                    .ok();
+                buf
+            } else {
+                Vec::new()
+            };
+            let stderr_excerpt = Self::redact_stderr(&stderr);
             let stderr_note = if stderr_excerpt.is_empty() {
                 String::new()
             } else {
                 format!(" Stderr: {stderr_excerpt}")
             };
             anyhow::bail!(
-                "Claude Code exited with non-zero status {code}. \
-                 Check that Claude Code is authenticated and the CLI is supported.{stderr_note}"
+                "Claude Code exited with non-zero status {}. \
+                 Check that Claude Code is authenticated and the CLI is supported.{stderr_note}",
+                status.code().unwrap_or(-1)
             );
         }
 
-        let raw = String::from_utf8(output.stdout)
-            .map_err(|err| anyhow::anyhow!("Claude Code produced non-UTF-8 output: {err}"))?;
+        // Build the response with progress summary and status line.
+        let mut response = String::new();
 
-        let (text, new_session_id) = Self::parse_output(&raw);
-
-        // Persist the session ID for future --resume calls.
-        if let Some(new_id) = new_session_id {
-            // Extract the session key from the original message (before stripping).
-            // We stored it earlier; use the key captured in invoke_cli.
-            // Since invoke_cli_inner doesn't have the key, we pass it back
-            // through the return value and let invoke_cli handle storage.
-            // For now, store it if we can recover the key from the caller context.
-            //
-            // Note: session storage is handled by invoke_cli after this returns.
-            // We encode the session_id in a special return format.
-            return Ok(format!("[ZEROCLAW_NEW_SESSION:{new_id}]\n{text}"));
+        if !stream.tool_calls.is_empty() {
+            response.push_str(&Self::build_progress_summary(&stream.tool_calls));
         }
 
-        Ok(text)
+        response.push_str(&stream.result_text);
+        response.push_str(&Self::build_status_line(&stream));
+
+        // Encode session ID for the caller to persist.
+        if let Some(ref session_id) = stream.session_id {
+            return Ok(format!("[ZEROCLAW_NEW_SESSION:{session_id}]\n{response}"));
+        }
+
+        Ok(response)
     }
 
-    /// Post-process the response to extract and store any new session ID.
-    fn store_session_from_response(
-        &self,
-        response: &mut String,
-        session_key: Option<&str>,
-    ) {
-        if let Some(rest) = response.strip_prefix("[ZEROCLAW_NEW_SESSION:") {
-            if let Some(end) = rest.find(']') {
-                let new_id = rest[..end].trim().to_string();
-                let remainder = rest[end + 1..].trim_start_matches('\n').to_string();
-                if let Some(key) = session_key {
-                    tracing::info!(
-                        session_key = key,
-                        session_id = new_id.as_str(),
-                        "Claude Code session persisted for --resume"
-                    );
-                    self.set_session(key.to_string(), new_id);
-                }
-                *response = remainder;
-            }
+    // Keep parse_output for backward compat / tests.
+    fn parse_output(stdout: &str) -> (String, Option<String>) {
+        #[derive(Deserialize)]
+        struct JsonOutput {
+            result: Option<String>,
+            session_id: Option<String>,
+        }
+        let trimmed = stdout.trim();
+        if let Ok(parsed) = serde_json::from_str::<JsonOutput>(trimmed) {
+            (parsed.result.unwrap_or_default(), parsed.session_id)
+        } else {
+            (trimmed.to_string(), None)
         }
     }
 }
@@ -380,14 +533,7 @@ impl Provider for ClaudeCodeProvider {
             _ => message.to_string(),
         };
 
-        // Extract session key before invoke. CWD directive comes first,
-        // so strip it before looking for the session key.
-        let (_, after_cwd) = Self::extract_cwd(&full_message);
-        let (session_key, _) = Self::extract_session_key(after_cwd);
-
-        let mut result = self.invoke_cli(&full_message, model).await?;
-        self.store_session_from_response(&mut result, session_key.as_deref());
-        Ok(result)
+        self.invoke_cli(&full_message, model).await
     }
 
     async fn chat(
@@ -465,9 +611,7 @@ mod tests {
 
     #[test]
     fn should_forward_model_standard() {
-        assert!(ClaudeCodeProvider::should_forward_model(
-            "claude-sonnet-4-20250514"
-        ));
+        assert!(ClaudeCodeProvider::should_forward_model("claude-sonnet-4-20250514"));
         assert!(ClaudeCodeProvider::should_forward_model("claude-3.5-sonnet"));
     }
 
@@ -481,16 +625,11 @@ mod tests {
     // ── Temperature ──
 
     #[test]
-    fn validate_temperature_allows_defaults() {
+    fn validate_temperature_allows_any_finite() {
         assert!(ClaudeCodeProvider::validate_temperature(0.7).is_ok());
         assert!(ClaudeCodeProvider::validate_temperature(1.0).is_ok());
-    }
-
-    #[test]
-    fn validate_temperature_clamps_unsupported() {
-        // Should not error — we clamp instead of rejecting.
-        assert!(ClaudeCodeProvider::validate_temperature(0.2).is_ok());
         assert!(ClaudeCodeProvider::validate_temperature(0.1).is_ok());
+        assert!(ClaudeCodeProvider::validate_temperature(0.2).is_ok());
     }
 
     // ── CWD directive ──
@@ -548,38 +687,110 @@ mod tests {
         assert_eq!(rest, "What time is it?");
     }
 
-    // ── JSON output parsing ──
+    // ── Stream event processing ──
 
     #[test]
-    fn parse_output_extracts_result_and_session() {
-        let json = r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello world","session_id":"abc-123","total_cost_usd":0.01}"#;
-        let (text, session_id) = ClaudeCodeProvider::parse_output(json);
-        assert_eq!(text, "Hello world");
-        assert_eq!(session_id.unwrap(), "abc-123");
+    fn process_stream_event_result() {
+        let event = r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello world","session_id":"abc-123","total_cost_usd":0.0142,"duration_ms":8500,"num_turns":3,"usage":{"input_tokens":1500,"output_tokens":200,"cache_read_input_tokens":500}}"#;
+        let mut result = StreamResult::default();
+        ClaudeCodeProvider::process_stream_event(event, &mut result);
+        assert_eq!(result.result_text, "Hello world");
+        assert_eq!(result.session_id.as_deref(), Some("abc-123"));
+        assert!(!result.is_error);
+        assert_eq!(result.input_tokens, 1500);
+        assert_eq!(result.output_tokens, 200);
+        assert_eq!(result.cache_read_tokens, 500);
+        assert!((result.cost_usd - 0.0142).abs() < 0.0001);
+        assert_eq!(result.duration_ms, 8500);
+        assert_eq!(result.num_turns, 3);
     }
 
     #[test]
-    fn parse_output_handles_error_response() {
-        let json = r#"{"type":"result","is_error":true,"result":"Not logged in","session_id":"def-456"}"#;
-        let (text, session_id) = ClaudeCodeProvider::parse_output(json);
-        assert_eq!(text, "Not logged in");
-        assert_eq!(session_id.unwrap(), "def-456");
+    fn process_stream_event_tool_use() {
+        let event = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","id":"t1"},{"type":"tool_use","name":"Read","id":"t2"}]}}"#;
+        let mut result = StreamResult::default();
+        ClaudeCodeProvider::process_stream_event(event, &mut result);
+        assert_eq!(result.tool_calls, vec!["Bash", "Read"]);
     }
 
     #[test]
-    fn parse_output_handles_missing_fields() {
-        let json = r#"{"type":"result"}"#;
-        let (text, session_id) = ClaudeCodeProvider::parse_output(json);
-        assert_eq!(text, "");
-        assert!(session_id.is_none());
+    fn process_stream_event_ignores_unknown() {
+        let event = r#"{"type":"system","subtype":"init","session_id":"xyz"}"#;
+        let mut result = StreamResult::default();
+        ClaudeCodeProvider::process_stream_event(event, &mut result);
+        assert!(result.result_text.is_empty());
+        assert!(result.session_id.is_none()); // Only captured from "result" events.
     }
 
     #[test]
-    fn parse_output_falls_back_to_raw_text() {
-        let raw = "This is plain text, not JSON";
-        let (text, session_id) = ClaudeCodeProvider::parse_output(raw);
-        assert_eq!(text, raw);
-        assert!(session_id.is_none());
+    fn process_stream_event_ignores_garbage() {
+        let mut result = StreamResult::default();
+        ClaudeCodeProvider::process_stream_event("not json at all", &mut result);
+        assert!(result.result_text.is_empty());
+    }
+
+    // ── Status line formatting ──
+
+    #[test]
+    fn build_status_line_full() {
+        let result = StreamResult {
+            session_id: Some("abcdef12-3456-7890".into()),
+            input_tokens: 45200,
+            output_tokens: 1200,
+            cache_read_tokens: 30000,
+            cost_usd: 0.0523,
+            duration_ms: 12400,
+            tool_calls: vec!["Bash".into(), "Read".into(), "Bash".into()],
+            ..Default::default()
+        };
+        let line = ClaudeCodeProvider::build_status_line(&result);
+        assert!(line.contains("session abcdef12"));
+        assert!(line.contains("45.2kin"));
+        assert!(line.contains("1.2kout"));
+        assert!(line.contains("30.0kcached"));
+        assert!(line.contains("$0.0523"));
+        assert!(line.contains("12.4s"));
+        assert!(line.contains("3 tool calls"));
+    }
+
+    #[test]
+    fn build_status_line_empty() {
+        let result = StreamResult::default();
+        let line = ClaudeCodeProvider::build_status_line(&result);
+        assert!(line.is_empty());
+    }
+
+    // ── Progress summary ──
+
+    #[test]
+    fn build_progress_summary_deduplicates() {
+        let calls = vec![
+            "Bash".into(),
+            "Read".into(),
+            "Bash".into(),
+            "Write".into(),
+            "Bash".into(),
+        ];
+        let summary = ClaudeCodeProvider::build_progress_summary(&calls);
+        assert!(summary.contains("Bash x3"));
+        assert!(summary.contains("Read"));
+        assert!(summary.contains("Write"));
+    }
+
+    #[test]
+    fn build_progress_summary_empty() {
+        let summary = ClaudeCodeProvider::build_progress_summary(&[]);
+        assert!(summary.is_empty());
+    }
+
+    // ── Token formatting ──
+
+    #[test]
+    fn format_tokens_units() {
+        assert_eq!(ClaudeCodeProvider::format_tokens(500), "500");
+        assert_eq!(ClaudeCodeProvider::format_tokens(1500), "1.5k");
+        assert_eq!(ClaudeCodeProvider::format_tokens(45200), "45.2k");
+        assert_eq!(ClaudeCodeProvider::format_tokens(1_500_000), "1.5M");
     }
 
     // ── Session storage ──
@@ -588,11 +799,8 @@ mod tests {
     fn session_store_and_retrieve() {
         let provider = ClaudeCodeProvider::new();
         assert!(provider.get_session("room1").is_none());
-
         provider.set_session("room1".into(), "session-abc".into());
         assert_eq!(provider.get_session("room1").unwrap(), "session-abc");
-
-        // Update overwrites.
         provider.set_session("room1".into(), "session-def".into());
         assert_eq!(provider.get_session("room1").unwrap(), "session-def");
     }
@@ -608,38 +816,57 @@ mod tests {
     #[test]
     fn session_clear_nonexistent_is_noop() {
         let provider = ClaudeCodeProvider::new();
-        provider.clear_session("nonexistent"); // Should not panic.
+        provider.clear_session("nonexistent");
     }
 
-    // ── Response session extraction ──
+    // ── Response finalization ──
 
     #[test]
-    fn store_session_from_response_extracts_and_stores() {
+    fn finalize_response_extracts_and_stores_session() {
         let provider = ClaudeCodeProvider::new();
-        let mut response = "[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".to_string();
-        provider.store_session_from_response(&mut response, Some("room1"));
+        let response = provider.finalize_response(
+            "[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".into(),
+            Some("room1"),
+        );
         assert_eq!(response, "Hello world");
         assert_eq!(provider.get_session("room1").unwrap(), "sess-xyz");
     }
 
     #[test]
-    fn store_session_from_response_no_directive() {
+    fn finalize_response_strips_without_key() {
         let provider = ClaudeCodeProvider::new();
-        let mut response = "Hello world".to_string();
-        provider.store_session_from_response(&mut response, Some("room1"));
+        let response = provider.finalize_response(
+            "[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".into(),
+            None,
+        );
+        assert_eq!(response, "Hello world");
+        assert!(provider.get_session("anything").is_none());
+    }
+
+    #[test]
+    fn finalize_response_no_directive() {
+        let provider = ClaudeCodeProvider::new();
+        let response = provider.finalize_response("Hello world".into(), Some("room1"));
         assert_eq!(response, "Hello world");
         assert!(provider.get_session("room1").is_none());
     }
 
+    // ── JSON output parsing (backward compat) ──
+
     #[test]
-    fn store_session_from_response_no_key_strips_but_does_not_store() {
-        let provider = ClaudeCodeProvider::new();
-        let mut response = "[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".to_string();
-        provider.store_session_from_response(&mut response, None);
-        // Directive is always stripped from user-visible response,
-        // but without a key, nothing is stored.
-        assert_eq!(response, "Hello world");
-        assert!(provider.get_session("anything").is_none());
+    fn parse_output_extracts_result_and_session() {
+        let json = r#"{"type":"result","result":"Hello world","session_id":"abc-123"}"#;
+        let (text, session_id) = ClaudeCodeProvider::parse_output(json);
+        assert_eq!(text, "Hello world");
+        assert_eq!(session_id.unwrap(), "abc-123");
+    }
+
+    #[test]
+    fn parse_output_falls_back_to_raw_text() {
+        let raw = "This is plain text, not JSON";
+        let (text, session_id) = ClaudeCodeProvider::parse_output(raw);
+        assert_eq!(text, raw);
+        assert!(session_id.is_none());
     }
 
     // ── CLI invocation ──
