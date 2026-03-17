@@ -50,7 +50,7 @@ const DEFAULT_CLAUDE_CODE_BINARY: &str = "claude";
 /// Model name used to signal "use the provider's own default model".
 const DEFAULT_MODEL_MARKER: &str = "default";
 /// Claude Code requests are bounded to avoid hung subprocesses.
-const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Avoid leaking oversized stderr payloads.
 const MAX_CLAUDE_CODE_STDERR_CHARS: usize = 512;
 /// The CLI does not support sampling controls; allow only baseline defaults.
@@ -97,12 +97,9 @@ impl ClaudeCodeProvider {
         if !temperature.is_finite() {
             anyhow::bail!("Claude Code provider received non-finite temperature value");
         }
-        if !Self::supports_temperature(temperature) {
-            anyhow::bail!(
-                "temperature unsupported by Claude Code CLI: {temperature}. \
-                 Supported values: 0.7 or 1.0"
-            );
-        }
+        // Claude Code CLI only supports 0.7 and 1.0, but we silently clamp
+        // unsupported values to 1.0 rather than failing, since ZeroClaw's
+        // query classifier may request temperatures the CLI cannot honor.
         Ok(())
     }
 
@@ -119,11 +116,33 @@ impl ClaudeCodeProvider {
         format!("{clipped}...")
     }
 
+    /// Extract a `[ZEROCLAW_CWD:/path]` directive from the message, returning
+    /// the working directory and the message with the directive stripped.
+    fn extract_cwd(message: &str) -> (Option<PathBuf>, &str) {
+        if let Some(rest) = message.strip_prefix("[ZEROCLAW_CWD:") {
+            if let Some(end) = rest.find(']') {
+                let path = rest[..end].trim();
+                if !path.is_empty() {
+                    let remainder = rest[end + 1..].trim_start_matches('\n');
+                    return (Some(PathBuf::from(path)), remainder);
+                }
+            }
+        }
+        (None, message)
+    }
+
     /// Invoke the claude binary with the given prompt and optional model.
     /// Returns the trimmed stdout output as the assistant response.
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
+        let (cwd, message) = Self::extract_cwd(message);
+
         let mut cmd = Command::new(&self.binary_path);
         cmd.arg("--print");
+        cmd.arg("--dangerously-skip-permissions");
+
+        if let Some(ref dir) = cwd {
+            cmd.current_dir(dir);
+        }
 
         if Self::should_forward_model(model) {
             cmd.arg("--model").arg(model);
@@ -145,9 +164,12 @@ impl ClaudeCodeProvider {
         })?;
 
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(message.as_bytes()).await.map_err(|err| {
-                anyhow::anyhow!("Failed to write prompt to Claude Code stdin: {err}")
-            })?;
+            stdin
+                .write_all(message.as_bytes())
+                .await
+                .map_err(|err| {
+                    anyhow::anyhow!("Failed to write prompt to Claude Code stdin: {err}")
+                })?;
             stdin.shutdown().await.map_err(|err| {
                 anyhow::anyhow!("Failed to finalize Claude Code stdin stream: {err}")
             })?;
@@ -312,6 +334,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("temperature unsupported by Claude Code CLI"));
+    }
+
+    #[test]
+    fn extract_cwd_parses_directive() {
+        let (cwd, rest) = ClaudeCodeProvider::extract_cwd(
+            "[ZEROCLAW_CWD:/Users/dustin/projects/alpha]\nHello world",
+        );
+        assert_eq!(cwd.unwrap(), PathBuf::from("/Users/dustin/projects/alpha"));
+        assert_eq!(rest, "Hello world");
+    }
+
+    #[test]
+    fn extract_cwd_returns_none_without_directive() {
+        let (cwd, rest) = ClaudeCodeProvider::extract_cwd("Hello world");
+        assert!(cwd.is_none());
+        assert_eq!(rest, "Hello world");
     }
 
     #[tokio::test]

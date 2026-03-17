@@ -87,6 +87,12 @@ pub struct Config {
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
+    /// Map channel identifiers (e.g. Matrix room IDs) to local workspace paths.
+    /// When a message arrives from a mapped channel, the provider runs in that directory.
+    /// Example: `{ "!roomABC:server" = "/Users/me/projects/alpha" }`
+    #[serde(default)]
+    pub channel_workspaces: HashMap<String, String>,
+
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     #[serde(
         default = "default_temperature",
@@ -4013,6 +4019,11 @@ pub struct MatrixConfig {
     /// Optional Matrix device ID.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Additional Matrix room IDs to listen in. Combined with `room_id`.
+    /// Enables multi-room routing where each room can map to a different workspace
+    /// via `channel_workspaces`.
+    #[serde(default)]
+    pub room_ids: Vec<String>,
     /// Matrix room ID to listen in (e.g. `"!abc123:matrix.org"`).
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
@@ -5229,6 +5240,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
             default_temperature: default_temperature(),
             provider_timeout_secs: default_provider_timeout_secs(),
             extra_headers: HashMap::new(),
@@ -8157,6 +8169,7 @@ tool_dispatcher = "xml"
             access_token: "syt_token_abc".into(),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
+            room_ids: Vec::new(),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
         };
@@ -8177,6 +8190,7 @@ tool_dispatcher = "xml"
             access_token: "tok".into(),
             user_id: None,
             device_id: None,
+            room_ids: Vec::new(),
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
         };
@@ -8266,6 +8280,7 @@ allowed_users = ["@ops:matrix.org"]
                 access_token: "tok".into(),
                 user_id: None,
                 device_id: None,
+                room_ids: Vec::new(),
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
             }),

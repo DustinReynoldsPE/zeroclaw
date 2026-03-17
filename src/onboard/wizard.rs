@@ -138,6 +138,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_provider: Some(provider),
         default_model: Some(model),
         model_providers: std::collections::HashMap::new(),
+        channel_workspaces: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
         extra_headers: std::collections::HashMap::new(),
@@ -508,6 +509,7 @@ async fn run_quick_setup_with_home(
         default_provider: Some(provider_name.clone()),
         default_model: Some(model.clone()),
         model_providers: std::collections::HashMap::new(),
+        channel_workspaces: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
         extra_headers: std::collections::HashMap::new(),
@@ -4057,6 +4059,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     access_token,
                     user_id: detected_user_id,
                     device_id: detected_device_id,
+                    room_ids: Vec::new(),
                     room_id,
                     allowed_users,
                 });

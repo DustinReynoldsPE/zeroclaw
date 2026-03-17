@@ -313,6 +313,8 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    /// Maps channel identifiers (e.g. Matrix room IDs) to local workspace paths.
+    channel_workspace_map: Arc<HashMap<String, PathBuf>>,
     message_timeout_secs: u64,
     interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: crate::config::MultimodalConfig,
@@ -1982,6 +1984,19 @@ async fn process_channel_message(
 
     let system_prompt =
         build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+
+    // Resolve per-channel workspace: check reply_target (room ID) then channel name.
+    let workspace_prefix = ctx
+        .channel_workspace_map
+        .get(&msg.reply_target)
+        .or_else(|| ctx.channel_workspace_map.get(&msg.channel))
+        .map(|dir| format!("[ZEROCLAW_CWD:{}]\n", dir.display()));
+
+    let system_prompt = match workspace_prefix {
+        Some(prefix) => format!("{prefix}{system_prompt}"),
+        None => system_prompt,
+    };
+
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -3982,6 +3997,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        channel_workspace_map: Arc::new(
+            config
+                .channel_workspaces
+                .iter()
+                .map(|(k, v)| (k.clone(), PathBuf::from(v)))
+                .collect(),
+        ),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
