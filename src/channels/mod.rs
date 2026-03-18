@@ -3345,6 +3345,7 @@ fn collect_configured_channels(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
+                .with_allowed_rooms(config.channel_workspaces.keys().cloned())
                 .with_transcription(Some(config.transcription.clone()))
                 .with_tts(Some(config.tts.clone())),
             ),

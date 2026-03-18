@@ -19,7 +19,7 @@ use matrix_sdk::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -47,6 +47,9 @@ pub struct MatrixChannel {
     last_draft_edit: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// Tracks the current visible event ID for delete-and-resend draft updates.
     draft_current_event: Arc<Mutex<Option<String>>>,
+    /// Additional rooms to listen on (from channel_workspaces config).
+    /// The configured `room_id` is always included implicitly.
+    allowed_rooms: HashSet<String>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -186,7 +189,15 @@ impl MatrixChannel {
             tts_api_url: None,
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             draft_current_event: Arc::new(Mutex::new(None)),
+            allowed_rooms: HashSet::new(),
         }
+    }
+
+    /// Add extra rooms to listen on (e.g. from channel_workspaces keys).
+    /// The configured `room_id` is always accepted regardless.
+    pub fn with_allowed_rooms(mut self, rooms: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_rooms = rooms.into_iter().collect();
+        self
     }
 
     pub fn with_transcription(mut self, config: Option<TranscriptionConfig>) -> Self {
@@ -1132,9 +1143,19 @@ impl Channel for MatrixChannel {
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
+        // Build the set of rooms we accept messages from.
+        // The configured room_id always passes; additional rooms come from channel_workspaces.
+        let mut accepted_rooms: HashSet<OwnedRoomId> = HashSet::new();
+        accepted_rooms.insert(target_room.clone());
+        for room_str in &self.allowed_rooms {
+            if let Ok(parsed) = room_str.parse::<OwnedRoomId>() {
+                accepted_rooms.insert(parsed);
+            }
+        }
+
         tracing::info!(
-            "Matrix channel listening on room {} (configured as {})...",
-            target_room_id,
+            "Matrix channel listening on {} room(s) (primary: {})",
+            accepted_rooms.len(),
             self.room_id
         );
 
@@ -1144,7 +1165,7 @@ impl Channel for MatrixChannel {
         )));
 
         let tx_handler = tx.clone();
-        let target_room_for_handler = target_room.clone();
+        let accepted_rooms_for_handler = Arc::new(accepted_rooms);
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
@@ -1155,7 +1176,7 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
+            let accepted_rooms = Arc::clone(&accepted_rooms_for_handler);
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
@@ -1165,7 +1186,7 @@ impl Channel for MatrixChannel {
             let transcription_config = transcription_config_for_handler.clone();
 
             async move {
-                if room.room_id() != target_room {
+                if !accepted_rooms.contains(room.room_id()) {
                     return;
                 }
 
