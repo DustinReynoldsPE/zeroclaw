@@ -15,7 +15,7 @@
 //!
 //! - `CLAUDE_CODE_PATH` — override the path to the `claude` binary (default: `"claude"`)
 
-use crate::providers::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -67,19 +67,47 @@ pub struct ClaudeCodeProvider {
     binary_path: PathBuf,
     /// Maps session keys (e.g. room IDs) to Claude Code session IDs.
     sessions: Arc<Mutex<HashMap<String, String>>>,
+    /// Optional path for persisting the session map across restarts.
+    sessions_file: Option<PathBuf>,
 }
 
 impl ClaudeCodeProvider {
     pub fn new() -> Self {
+        Self::with_state_dir(None)
+    }
+
+    /// Create a provider with an optional state directory for session persistence.
+    ///
+    /// When `state_dir` is provided, the session_key→session_id mapping is
+    /// persisted to `{state_dir}/claude_code_sessions.json` so that `--resume`
+    /// survives daemon restarts.
+    pub fn with_state_dir(state_dir: Option<&std::path::Path>) -> Self {
         let binary_path = std::env::var(CLAUDE_CODE_PATH_ENV)
             .ok()
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_CODE_BINARY));
 
+        let sessions_file = state_dir.map(|dir| dir.join("claude_code_sessions.json"));
+
+        let sessions = sessions_file
+            .as_ref()
+            .and_then(|path| {
+                let data = std::fs::read_to_string(path).ok()?;
+                let map: HashMap<String, String> = serde_json::from_str(&data).ok()?;
+                tracing::info!(
+                    count = map.len(),
+                    path = %path.display(),
+                    "Loaded persisted Claude Code session mappings"
+                );
+                Some(map)
+            })
+            .unwrap_or_default();
+
         Self {
             binary_path,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(Mutex::new(sessions)),
+            sessions_file,
         }
     }
 
@@ -141,12 +169,37 @@ impl ClaudeCodeProvider {
     fn set_session(&self, key: String, session_id: String) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.insert(key, session_id);
+            self.persist_sessions(&sessions);
         }
     }
 
     fn clear_session(&self, key: &str) {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(key);
+            self.persist_sessions(&sessions);
+        }
+    }
+
+    /// Write the current session map to disk (best-effort, errors are logged).
+    fn persist_sessions(&self, sessions: &HashMap<String, String>) {
+        let Some(ref path) = self.sessions_file else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(path = %parent.display(), error = %e, "Failed to create sessions dir");
+                return;
+            }
+        }
+        match serde_json::to_string(sessions) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(path, json) {
+                    tracing::warn!(path = %path.display(), error = %e, "Failed to persist session map");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to serialize session map");
+            }
         }
     }
 
@@ -179,10 +232,7 @@ impl ClaudeCodeProvider {
                     .get("duration_ms")
                     .and_then(|d| d.as_u64())
                     .unwrap_or(0);
-                result.num_turns = event
-                    .get("num_turns")
-                    .and_then(|n| n.as_u64())
-                    .unwrap_or(0);
+                result.num_turns = event.get("num_turns").and_then(|n| n.as_u64()).unwrap_or(0);
 
                 if let Some(usage) = event.get("usage") {
                     result.input_tokens = usage
@@ -201,9 +251,7 @@ impl ClaudeCodeProvider {
             }
             Some("assistant") => {
                 // Extract tool_use calls for progress tracking.
-                if let Some(content) = event
-                    .pointer("/message/content")
-                    .and_then(|c| c.as_array())
+                if let Some(content) = event.pointer("/message/content").and_then(|c| c.as_array())
                 {
                     for item in content {
                         if item.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
@@ -246,7 +294,10 @@ impl ClaudeCodeProvider {
                 Self::format_tokens(result.output_tokens),
             ));
             if result.cache_read_tokens > 0 {
-                parts.push(format!("{}cached", Self::format_tokens(result.cache_read_tokens)));
+                parts.push(format!(
+                    "{}cached",
+                    Self::format_tokens(result.cache_read_tokens)
+                ));
             }
         }
 
@@ -301,6 +352,40 @@ impl ClaudeCodeProvider {
         summary
     }
 
+    /// Format prior conversation turns as a text preamble for the prompt.
+    ///
+    /// Used when `--resume` is unavailable so the model still sees earlier
+    /// messages as context rather than discarding them.
+    fn format_history_as_context(messages: &[ChatMessage]) -> Option<String> {
+        let turns: Vec<&ChatMessage> = messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "assistant")
+            .collect();
+
+        // Nothing useful to prepend if there is at most one user message.
+        if turns.len() <= 1 {
+            return None;
+        }
+
+        // Everything except the final user message becomes context.
+        let prior = &turns[..turns.len() - 1];
+        if prior.is_empty() {
+            return None;
+        }
+
+        let mut ctx = String::from("[Previous conversation]\n");
+        for msg in prior {
+            let label = if msg.role == "user" {
+                "User"
+            } else {
+                "Assistant"
+            };
+            writeln!(ctx, "{label}: {}", msg.content).ok();
+        }
+        ctx.push_str("[End of previous conversation]\n\n");
+        Some(ctx)
+    }
+
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let (cwd, message) = Self::extract_cwd(message);
         let (session_key, message) = Self::extract_session_key(message);
@@ -314,7 +399,13 @@ impl ClaudeCodeProvider {
         };
 
         let result = self
-            .invoke_cli_inner(message, model, cwd.as_ref(), resume_id.as_deref(), resume_timeout)
+            .invoke_cli_inner(
+                message,
+                model,
+                cwd.as_ref(),
+                resume_id.as_deref(),
+                resume_timeout,
+            )
             .await;
 
         // If --resume failed, clear stale session and retry without it.
@@ -327,7 +418,13 @@ impl ClaudeCodeProvider {
                 self.clear_session(key);
             }
             let fresh = self
-                .invoke_cli_inner(message, model, cwd.as_ref(), None, CLAUDE_CODE_REQUEST_TIMEOUT)
+                .invoke_cli_inner(
+                    message,
+                    model,
+                    cwd.as_ref(),
+                    None,
+                    CLAUDE_CODE_REQUEST_TIMEOUT,
+                )
                 .await?;
             return Ok(self.finalize_response(fresh, session_key.as_deref()));
         }
@@ -400,12 +497,9 @@ impl ClaudeCodeProvider {
 
         // Write prompt to stdin.
         if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(message.as_bytes())
-                .await
-                .map_err(|err| {
-                    anyhow::anyhow!("Failed to write prompt to Claude Code stdin: {err}")
-                })?;
+            stdin.write_all(message.as_bytes()).await.map_err(|err| {
+                anyhow::anyhow!("Failed to write prompt to Claude Code stdin: {err}")
+            })?;
             stdin.shutdown().await.map_err(|err| {
                 anyhow::anyhow!("Failed to finalize Claude Code stdin stream: {err}")
             })?;
@@ -425,7 +519,7 @@ impl ClaudeCodeProvider {
                 line = reader.next_line() => {
                     line.map_err(|err| anyhow::anyhow!("Error reading Claude Code stdout: {err}"))?
                 }
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     child.kill().await.ok();
                     anyhow::bail!(
                         "Claude Code request timed out after {:?} (binary: {})",
@@ -448,9 +542,10 @@ impl ClaudeCodeProvider {
         }
 
         // Wait for process to fully exit and check status.
-        let status = child.wait().await.map_err(|err| {
-            anyhow::anyhow!("Failed to wait for Claude Code process: {err}")
-        })?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to wait for Claude Code process: {err}"))?;
 
         if !status.success() && stream.result_text.is_empty() {
             // Read stderr for diagnostics.
@@ -512,7 +607,7 @@ impl ClaudeCodeProvider {
 
 impl Default for ClaudeCodeProvider {
     fn default() -> Self {
-        Self::new()
+        Self::with_state_dir(None)
     }
 }
 
@@ -534,6 +629,55 @@ impl Provider for ClaudeCodeProvider {
             _ => message.to_string(),
         };
 
+        self.invoke_cli(&full_message, model).await
+    }
+
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        Self::validate_temperature(temperature)?;
+
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+        let last_user = messages
+            .iter()
+            .rfind(|m| m.role == "user")
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+
+        // Peek at the last user message for a session key to decide if
+        // --resume will be available.
+        let (_, after_cwd) = Self::extract_cwd(last_user);
+        let (session_key, _) = Self::extract_session_key(after_cwd);
+        let has_resume = session_key
+            .as_ref()
+            .and_then(|k| self.get_session(k))
+            .is_some();
+
+        // When --resume is available, the CLI already has the full
+        // conversation context — just send the latest message.
+        // When it is not, prepend prior turns so the model sees history.
+        let mut full_message = String::new();
+
+        if let Some(sys) = system {
+            if !sys.is_empty() {
+                full_message.push_str(sys);
+                full_message.push_str("\n\n");
+            }
+        }
+
+        if !has_resume {
+            if let Some(ctx) = Self::format_history_as_context(messages) {
+                full_message.push_str(&ctx);
+            }
+        }
+
+        full_message.push_str(last_user);
         self.invoke_cli(&full_message, model).await
     }
 
@@ -612,13 +756,19 @@ mod tests {
 
     #[test]
     fn should_forward_model_standard() {
-        assert!(ClaudeCodeProvider::should_forward_model("claude-sonnet-4-20250514"));
-        assert!(ClaudeCodeProvider::should_forward_model("claude-3.5-sonnet"));
+        assert!(ClaudeCodeProvider::should_forward_model(
+            "claude-sonnet-4-20250514"
+        ));
+        assert!(ClaudeCodeProvider::should_forward_model(
+            "claude-3.5-sonnet"
+        ));
     }
 
     #[test]
     fn should_not_forward_default_model() {
-        assert!(!ClaudeCodeProvider::should_forward_model(DEFAULT_MODEL_MARKER));
+        assert!(!ClaudeCodeProvider::should_forward_model(
+            DEFAULT_MODEL_MARKER
+        ));
         assert!(!ClaudeCodeProvider::should_forward_model(""));
         assert!(!ClaudeCodeProvider::should_forward_model("   "));
     }
@@ -836,10 +986,8 @@ mod tests {
     #[test]
     fn finalize_response_strips_without_key() {
         let provider = ClaudeCodeProvider::new();
-        let response = provider.finalize_response(
-            "[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".into(),
-            None,
-        );
+        let response =
+            provider.finalize_response("[ZEROCLAW_NEW_SESSION:sess-xyz]\nHello world".into(), None);
         assert_eq!(response, "Hello world");
         assert!(provider.get_session("anything").is_none());
     }
@@ -870,6 +1018,84 @@ mod tests {
         assert!(session_id.is_none());
     }
 
+    // ── History context formatting ──
+
+    #[test]
+    fn format_history_single_user_message_returns_none() {
+        let messages = vec![ChatMessage::user("Hello")];
+        assert!(ClaudeCodeProvider::format_history_as_context(&messages).is_none());
+    }
+
+    #[test]
+    fn format_history_no_messages_returns_none() {
+        let messages: Vec<ChatMessage> = vec![];
+        assert!(ClaudeCodeProvider::format_history_as_context(&messages).is_none());
+    }
+
+    #[test]
+    fn format_history_includes_prior_turns() {
+        let messages = vec![
+            ChatMessage::user("What is Rust?"),
+            ChatMessage::assistant("Rust is a systems programming language."),
+            ChatMessage::user("Tell me more"),
+        ];
+        let ctx = ClaudeCodeProvider::format_history_as_context(&messages).unwrap();
+        assert!(ctx.contains("[Previous conversation]"));
+        assert!(ctx.contains("User: What is Rust?"));
+        assert!(ctx.contains("Assistant: Rust is a systems programming language."));
+        assert!(!ctx.contains("Tell me more"));
+        assert!(ctx.contains("[End of previous conversation]"));
+    }
+
+    #[test]
+    fn format_history_skips_system_messages() {
+        let messages = vec![
+            ChatMessage::system("Be helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi"),
+            ChatMessage::user("Bye"),
+        ];
+        let ctx = ClaudeCodeProvider::format_history_as_context(&messages).unwrap();
+        assert!(!ctx.contains("Be helpful"));
+        assert!(ctx.contains("User: Hello"));
+        assert!(ctx.contains("Assistant: Hi"));
+    }
+
+    // ── Disk persistence ──
+
+    #[test]
+    fn session_persists_to_disk_and_reloads() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let provider = ClaudeCodeProvider::with_state_dir(Some(dir.path()));
+        provider.set_session("room1".into(), "sess-aaa".into());
+        provider.set_session("room2".into(), "sess-bbb".into());
+
+        // Create a new provider from the same directory — should load persisted data.
+        let provider2 = ClaudeCodeProvider::with_state_dir(Some(dir.path()));
+        assert_eq!(provider2.get_session("room1").unwrap(), "sess-aaa");
+        assert_eq!(provider2.get_session("room2").unwrap(), "sess-bbb");
+    }
+
+    #[test]
+    fn session_clear_persists_removal() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let provider = ClaudeCodeProvider::with_state_dir(Some(dir.path()));
+        provider.set_session("room1".into(), "sess-aaa".into());
+        provider.clear_session("room1");
+
+        let provider2 = ClaudeCodeProvider::with_state_dir(Some(dir.path()));
+        assert!(provider2.get_session("room1").is_none());
+    }
+
+    #[test]
+    fn with_state_dir_none_does_not_persist() {
+        let provider = ClaudeCodeProvider::with_state_dir(None);
+        provider.set_session("room1".into(), "sess-aaa".into());
+        assert_eq!(provider.get_session("room1").unwrap(), "sess-aaa");
+        // No file written — no crash, just in-memory.
+        assert!(provider.sessions_file.is_none());
+    }
+
     // ── CLI invocation ──
 
     #[tokio::test]
@@ -877,6 +1103,7 @@ mod tests {
         let provider = ClaudeCodeProvider {
             binary_path: PathBuf::from("/nonexistent/path/to/claude"),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            sessions_file: None,
         };
         let result = provider.invoke_cli("hello", "default").await;
         assert!(result.is_err());

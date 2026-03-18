@@ -1254,7 +1254,9 @@ fn create_provider_with_url_and_options(
             "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
-        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
+        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::with_state_dir(
+            options.zeroclaw_dir.as_deref(),
+        ))),
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {
