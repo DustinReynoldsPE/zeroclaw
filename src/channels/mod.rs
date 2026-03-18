@@ -370,18 +370,18 @@ impl InFlightTaskCompletion {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
+    let room = extract_room_id(&msg.reply_target);
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
-        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+        Some(tid) => format!("{}_{}_{}_{}_{}", msg.channel, room, tid, msg.sender, msg.id),
+        None => format!("{}_{}_{}_{}", msg.channel, room, msg.sender, msg.id),
     }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic session isolation in forum groups
+    let room = extract_room_id(&msg.reply_target);
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}", msg.channel, tid, msg.sender),
-        None => format!("{}_{}", msg.channel, msg.sender),
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, room, tid, msg.sender),
+        None => format!("{}_{}_{}", msg.channel, room, msg.sender),
     }
 }
 
@@ -525,8 +525,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
+             - ALWAYS put your ENTIRE response in a SINGLE message. NEVER split responses into parts, \
+               say 'Part 1 above', or reference previous messages. Write everything in one reply.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n\
+             - Do NOT use CronCreate or scheduling tools unless the user explicitly asks for reminders or scheduled tasks.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -2066,9 +2069,12 @@ async fn process_channel_message(
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(id) => {
+                    tracing::info!("Draft sent on {}, id={:?}", channel.name(), id);
+                    id
+                }
                 Err(e) => {
-                    tracing::debug!("Failed to send draft on {}: {e}", channel.name());
+                    tracing::warn!("Failed to send draft on {}: {e}", channel.name());
                     None
                 }
             }
@@ -2087,14 +2093,17 @@ async fn process_channel_message(
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
+        tracing::info!("Spawning draft updater for draft_id={}", draft_id);
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
+            let mut update_count = 0u32;
             while let Some(delta) = rx.recv().await {
                 if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
                     accumulated.clear();
                     continue;
                 }
                 accumulated.push_str(&delta);
+                update_count += 1;
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
@@ -2102,8 +2111,10 @@ async fn process_channel_message(
                     tracing::debug!("Draft update failed: {e}");
                 }
             }
+            tracing::info!("Draft updater finished, {update_count} deltas received");
         }))
     } else {
+        tracing::info!("Draft updater NOT spawned: draft_id={:?}", draft_message_id);
         None
     };
 
@@ -5288,7 +5299,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_alice")
+            .get("telegram_chat-telegram_alice")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -5529,7 +5540,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
+        let route_key = "telegram_chat-1_alice";
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -5561,7 +5572,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_alice".to_string();
+        let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -7040,7 +7051,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        assert_eq!(conversation_memory_key(&msg), "slack_C456_U123_msg_abc123");
     }
 
     #[test]
@@ -7388,7 +7399,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_alice")
+            .get("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -7406,7 +7417,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_alice".to_string(),
+            "telegram_chat-telegram_alice".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
@@ -8151,7 +8162,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_zeroclaw_user")
+            .get("test-channel_chat-photo_zeroclaw_user")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");

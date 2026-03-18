@@ -59,7 +59,11 @@ pub async fn transcribe_audio(
         )
     })?;
 
-    let api_key = std::env::var("GROQ_API_KEY").ok();
+    let api_key = std::env::var("GROQ_API_KEY").ok().filter(|k| !k.is_empty());
+
+    if api_key.is_none() {
+        bail!("GROQ_API_KEY is not set — cannot call transcription API");
+    }
 
     let client = crate::config::build_runtime_proxy_client("transcription");
 

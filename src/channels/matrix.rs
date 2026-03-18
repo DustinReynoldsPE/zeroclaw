@@ -44,6 +44,9 @@ pub struct MatrixChannel {
     transcription_config: Option<TranscriptionConfig>,
     tts_config: Option<TtsConfig>,
     tts_api_url: Option<String>,
+    last_draft_edit: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Tracks the current visible event ID for delete-and-resend draft updates.
+    draft_current_event: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -181,6 +184,8 @@ impl MatrixChannel {
             transcription_config: None,
             tts_config: None,
             tts_api_url: None,
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
+            draft_current_event: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -192,9 +197,10 @@ impl MatrixChannel {
     pub fn with_tts(mut self, config: Option<TtsConfig>) -> Self {
         if let Some(ref cfg) = config {
             if cfg.enabled {
-                self.tts_api_url = cfg.openai.as_ref().map(|o| {
-                    format!("{}/v1/audio/speech", o.base_url.trim_end_matches('/'))
-                });
+                self.tts_api_url = cfg
+                    .openai
+                    .as_ref()
+                    .map(|o| format!("{}/v1/audio/speech", o.base_url.trim_end_matches('/')));
             }
         }
         self.tts_config = config;
@@ -691,11 +697,7 @@ impl Channel for MatrixChannel {
                         .as_ref()
                         .map(|c| c.default_voice.as_str())
                         .unwrap_or("echo");
-                    let speed = self
-                        .tts_config
-                        .as_ref()
-                        .map(|c| c.speed)
-                        .unwrap_or(1.0);
+                    let speed = self.tts_config.as_ref().map(|c| c.speed).unwrap_or(1.0);
                     let tts_body = serde_json::json!({
                         "model": "tts-1",
                         "input": &tts_text,
@@ -713,8 +715,7 @@ impl Channel for MatrixChannel {
                     {
                         Ok(resp) if resp.status().is_success() => {
                             if let Ok(bytes) = resp.bytes().await {
-                                result =
-                                    Some((bytes.to_vec(), "audio/wav", "voice-reply.wav"));
+                                result = Some((bytes.to_vec(), "audio/wav", "voice-reply.wav"));
                             }
                         }
                         Ok(resp) => {
@@ -746,9 +747,16 @@ impl Channel for MatrixChannel {
                     if say_ok {
                         let convert_ok = tokio::process::Command::new("ffmpeg")
                             .args([
-                                "-hide_banner", "-loglevel", "error", "-y",
-                                "-i", aiff_path.to_str().unwrap_or_default(),
-                                "-ar", "24000", "-ac", "1",
+                                "-hide_banner",
+                                "-loglevel",
+                                "error",
+                                "-y",
+                                "-i",
+                                aiff_path.to_str().unwrap_or_default(),
+                                "-ar",
+                                "24000",
+                                "-ac",
+                                "1",
                                 wav_path.to_str().unwrap_or_default(),
                             ])
                             .output()
@@ -767,8 +775,7 @@ impl Channel for MatrixChannel {
                 // Last resort: edge-tts (cloud)
                 if result.is_none() {
                     tracing::info!("Falling back to edge-tts");
-                    let mp3_path =
-                        std::path::PathBuf::from("/tmp/zeroclaw-voice/reply.mp3");
+                    let mp3_path = std::path::PathBuf::from("/tmp/zeroclaw-voice/reply.mp3");
                     let edge_ok = tokio::process::Command::new("edge-tts")
                         .args(["--text", &tts_text, "--write-media"])
                         .arg(&mp3_path)
@@ -809,10 +816,11 @@ impl Channel for MatrixChannel {
                                 if let Some(content_uri) = body["content_uri"].as_str() {
                                     tracing::info!(
                                         "Audio uploaded: {} ({} bytes) -> {}",
-                                        filename, audio_len, content_uri
+                                        filename,
+                                        audio_len,
+                                        content_uri
                                     );
-                                    let encoded_room =
-                                        Self::encode_path_segment(&target_room_id);
+                                    let encoded_room = Self::encode_path_segment(&target_room_id);
                                     let txn_id = format!(
                                         "voice_{}",
                                         std::time::SystemTime::now()
@@ -844,13 +852,15 @@ impl Channel for MatrixChannel {
                                     {
                                         Ok(put_resp) => {
                                             let status = put_resp.status();
-                                            let resp_body = put_resp.text().await.unwrap_or_default();
+                                            let resp_body =
+                                                put_resp.text().await.unwrap_or_default();
                                             if status.is_success() {
                                                 tracing::info!("Voice reply sent to Matrix");
                                             } else {
                                                 tracing::warn!(
                                                     "Voice PUT failed ({}): {}",
-                                                    status, resp_body
+                                                    status,
+                                                    resp_body
                                                 );
                                             }
                                         }
@@ -875,6 +885,226 @@ impl Channel for MatrixChannel {
             }
         }
 
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let room_id = if message.recipient.contains("||") {
+            message.recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let initial_text = if message.content.is_empty() {
+            "\u{2026}" // ellipsis
+        } else {
+            &message.content
+        };
+
+        let txn_id = format!(
+            "draft_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+
+        let body = serde_json::json!({
+            "msgtype": "m.text",
+            "body": initial_text,
+        });
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        let resp = self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix send_draft failed: {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let event_id = resp_json["event_id"].as_str().map(|s| s.to_string());
+
+        if let Some(ref id) = event_id {
+            self.last_draft_edit
+                .lock()
+                .await
+                .insert(id.clone(), std::time::Instant::now());
+        }
+
+        Ok(event_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit: at most one edit every 2 seconds
+        {
+            let edits = self.last_draft_edit.lock().await;
+            if let Some(last_time) = edits.get(message_id) {
+                if last_time.elapsed().as_millis() < 2000 {
+                    return Ok(());
+                }
+            }
+        }
+
+        let room_id = if recipient.contains("||") {
+            recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        // Use m.replace to silently edit the original draft message
+        let txn_id = format!(
+            "edit_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        let _ = self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("* {text}"),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": text,
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": message_id,
+                }
+            }))
+            .send()
+            .await;
+
+        self.last_draft_edit
+            .lock()
+            .await
+            .insert(message_id.to_string(), std::time::Instant::now());
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().await.remove(message_id);
+
+        let room_id = if recipient.contains("||") {
+            recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        // Redact the last visible draft message
+        let current_id = self
+            .draft_current_event
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| message_id.to_string());
+
+        let redact_txn = format!(
+            "redact_final_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let redact_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/redact/{}/{}",
+            self.homeserver,
+            encoded_room,
+            Self::encode_path_segment(&current_id),
+            redact_txn
+        );
+        let _ = self
+            .http_client
+            .put(&redact_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+
+        // Send final message as a clean new message (the caller in mod.rs
+        // handles this via channel.send if finalize_draft returns Err,
+        // but we do it here for the delete-and-resend pattern)
+        let txn_id = format!(
+            "final_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let send_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        match self
+            .http_client
+            .put(&send_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": text,
+            }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!("Matrix draft finalized (delete-and-resend)");
+            }
+            Ok(r) => {
+                let status = r.status();
+                let err = r.text().await.unwrap_or_default();
+                tracing::warn!("Matrix finalize_draft failed ({}): {}", status, err);
+                anyhow::bail!("finalize_draft send failed: {status}");
+            }
+            Err(e) => {
+                tracing::warn!("Matrix finalize_draft request error: {}", e);
+                anyhow::bail!("finalize_draft request error: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().await.remove(message_id);
+        *self.draft_current_event.lock().await = None;
         Ok(())
     }
 
@@ -925,7 +1155,7 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let _target_room = target_room_for_handler.clone();
+            let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
@@ -935,9 +1165,7 @@ impl Channel for MatrixChannel {
             let transcription_config = transcription_config_for_handler.clone();
 
             async move {
-                if false
-                /* multi-room: room_id filter disabled */
-                {
+                if room.room_id() != target_room {
                     return;
                 }
 
@@ -1028,37 +1256,35 @@ impl Channel for MatrixChannel {
                                 .map(|n| n.to_string_lossy().to_string())
                                 .unwrap_or_else(|| "audio.ogg".to_string());
                             match tokio::fs::read(&audio_path).await {
-                                Ok(audio_data) => {
-                                    match super::transcription::transcribe_audio(
-                                        audio_data, &file_name, config,
-                                    )
-                                    .await
-                                    {
-                                        Ok(text) if !text.trim().is_empty() => {
-                                            voice_mode.store(true, Ordering::Relaxed);
-                                            tracing::info!(
-                                                "Matrix voice transcription: {:?}",
-                                                text.trim()
-                                            );
-                                            format!("[Voice message]: {}", text.trim())
-                                        }
-                                        Ok(_) => {
-                                            tracing::warn!(
-                                                "Transcription returned empty text for {}",
-                                                file_name
-                                            );
-                                            body
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                "Transcription failed for {}: {}",
-                                                file_name,
-                                                e
-                                            );
-                                            body
-                                        }
+                                Ok(audio_data) => match super::transcription::transcribe_audio(
+                                    audio_data, &file_name, config,
+                                )
+                                .await
+                                {
+                                    Ok(text) if !text.trim().is_empty() => {
+                                        voice_mode.store(true, Ordering::Relaxed);
+                                        tracing::info!(
+                                            "Matrix voice transcription: {:?}",
+                                            text.trim()
+                                        );
+                                        format!("[Voice message]: {}", text.trim())
                                     }
-                                }
+                                    Ok(_) => {
+                                        tracing::warn!(
+                                            "Transcription returned empty text for {}",
+                                            file_name
+                                        );
+                                        body
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Transcription failed for {}: {}",
+                                            file_name,
+                                            e
+                                        );
+                                        body
+                                    }
+                                },
                                 Err(e) => {
                                     tracing::warn!(
                                         "Failed to read audio file {}: {}",
