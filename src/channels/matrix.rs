@@ -231,7 +231,7 @@ impl MatrixChannel {
                 // Drop code fences, horizontal rules, HTML tags
                 !trimmed.starts_with("```")
                     && !trimmed.starts_with("---")
-                    && !trimmed.starts_with("<")
+                    && !trimmed.starts_with('<')
             })
             .collect::<Vec<_>>()
             .join(" ");
@@ -247,11 +247,8 @@ impl MatrixChannel {
             .replace("### ", "");
 
         // Normalize dashes and whitespace
-        text = text
-            .replace("—", ", ")
-            .replace("–", ", ")
-            .replace('\n', " ")
-            .replace('\r', " ");
+        text = text.replace("—", ", ").replace('–', ", ");
+        text = text.replace(['\n', '\r'], " ");
 
         // Collapse multiple spaces
         while text.contains("  ") {
@@ -1039,7 +1036,6 @@ impl Channel for MatrixChannel {
         };
         let encoded_room = Self::encode_path_segment(&room_id);
 
-        // Redact the last visible draft message
         let current_id = self
             .draft_current_event
             .lock()
@@ -1047,31 +1043,7 @@ impl Channel for MatrixChannel {
             .take()
             .unwrap_or_else(|| message_id.to_string());
 
-        let redact_txn = format!(
-            "redact_final_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        );
-        let redact_url = format!(
-            "{}/_matrix/client/v3/rooms/{}/redact/{}/{}",
-            self.homeserver,
-            encoded_room,
-            Self::encode_path_segment(&current_id),
-            redact_txn
-        );
-        let _ = self
-            .http_client
-            .put(&redact_url)
-            .header("Authorization", self.auth_header_value())
-            .json(&serde_json::json!({}))
-            .send()
-            .await;
-
-        // Send final message as a clean new message (the caller in mod.rs
-        // handles this via channel.send if finalize_draft returns Err,
-        // but we do it here for the delete-and-resend pattern)
+        // Edit the draft message in-place via m.replace
         let txn_id = format!(
             "final_{}",
             std::time::SystemTime::now()
@@ -1079,24 +1051,32 @@ impl Channel for MatrixChannel {
                 .unwrap_or_default()
                 .as_millis()
         );
-        let send_url = format!(
+        let url = format!(
             "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
             self.homeserver, encoded_room, txn_id
         );
 
         match self
             .http_client
-            .put(&send_url)
+            .put(&url)
             .header("Authorization", self.auth_header_value())
             .json(&serde_json::json!({
                 "msgtype": "m.text",
-                "body": text,
+                "body": format!("* {text}"),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": text,
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": current_id,
+                }
             }))
             .send()
             .await
         {
             Ok(r) if r.status().is_success() => {
-                tracing::info!("Matrix draft finalized (delete-and-resend)");
+                tracing::info!("Matrix draft finalized (edit-in-place)");
             }
             Ok(r) => {
                 let status = r.status();
@@ -1148,8 +1128,13 @@ impl Channel for MatrixChannel {
         let mut accepted_rooms: HashSet<OwnedRoomId> = HashSet::new();
         accepted_rooms.insert(target_room.clone());
         for room_str in &self.allowed_rooms {
-            if let Ok(parsed) = room_str.parse::<OwnedRoomId>() {
-                accepted_rooms.insert(parsed);
+            match room_str.parse::<OwnedRoomId>() {
+                Ok(parsed) => {
+                    accepted_rooms.insert(parsed);
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable workspace room '{}': {}", room_str, e);
+                }
             }
         }
 

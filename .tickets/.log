@@ -1,0 +1,18 @@
+2026-03-19T15:27:19Z check-unanswered-messages-9037 created
+2026-03-19T15:29:17Z tiered-model-routing-63c1 created
+2026-03-19T15:48:39Z tiered-model-routing-63c1 stage triage→spec
+2026-03-19T15:48:39Z tiered-model-routing-63c1 stage spec→design
+2026-03-19T15:48:39Z tiered-model-routing-63c1 stage design→implement
+2026-03-19T15:48:39Z tiered-model-routing-63c1 stage implement→test
+2026-03-19T15:52:15Z haiku-local-model-2db7 created
+2026-03-19T16:18:32Z tiered-model-routing-63c1 stage test→done
+2026-03-19T16:18:32Z haiku-local-model-2db7 stage triage→spec
+2026-03-19T16:18:32Z haiku-local-model-2db7 stage spec→design
+2026-03-19T16:18:32Z haiku-local-model-2db7 stage design→implement
+2026-03-19T16:18:32Z haiku-local-model-2db7 stage implement→test
+2026-03-19T17:05:19Z add-usage-remaining-a4f4 created
+2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage triage→spec
+2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage spec→design
+2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage design→implement
+2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage implement→test
+2026-03-19T17:13:32Z add-usage-remaining-a4f4 stage test→verify

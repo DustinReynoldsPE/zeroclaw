@@ -1,4 +1,6 @@
 use crate::config::schema::QueryClassificationConfig;
+use crate::providers::traits::Provider;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationDecision {
@@ -13,6 +15,64 @@ pub struct ClassificationDecision {
 /// or no rule matches the message.
 pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<String> {
     classify_with_decision(config, message).map(|decision| decision.hint)
+}
+
+/// Classify a user message using a lightweight model call, falling back to
+/// static rules if the model is unavailable or returns an invalid hint.
+pub async fn classify_with_model(
+    config: &QueryClassificationConfig,
+    message: &str,
+    provider: Arc<dyn Provider>,
+    model: &str,
+    available_hints: &[String],
+) -> Option<String> {
+    if !config.enabled || available_hints.is_empty() {
+        return classify(config, message);
+    }
+
+    let hints_list = available_hints.join(", ");
+    let system_prompt = format!(
+        "You are a message classifier. Classify the user message into exactly one category.\n\
+         Available categories: {hints_list}\n\n\
+         Rules:\n\
+         - simple: greetings, time/date/weather, ticket creation, simple lookups, status checks\n\
+         - moderate: file operations, searches, code review, multi-step tasks, web lookups\n\
+         - complex: architecture, debugging, implementation, refactoring, deep analysis\n\n\
+         Respond with ONLY the category name, nothing else."
+    );
+
+    let timeout = std::time::Duration::from_secs(config.classifier_timeout_secs);
+    let result = tokio::time::timeout(
+        timeout,
+        provider.chat_with_system(Some(&system_prompt), message, model, 0.0),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(response)) => {
+            let hint = response.trim().to_lowercase();
+            if available_hints.iter().any(|h| h == &hint) {
+                tracing::info!(
+                    hint = hint.as_str(),
+                    "Model-based classification"
+                );
+                return Some(hint);
+            }
+            tracing::warn!(
+                response = hint.as_str(),
+                "Model classifier returned invalid hint, falling back to static rules"
+            );
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "Model classifier failed, falling back to static rules");
+        }
+        Err(_) => {
+            tracing::warn!("Model classifier timed out, falling back to static rules");
+        }
+    }
+
+    // Fall back to static keyword rules
+    classify(config, message)
 }
 
 /// Classify a user message and return the matched hint together with
@@ -71,7 +131,13 @@ mod tests {
     use crate::config::schema::{ClassificationRule, QueryClassificationConfig};
 
     fn make_config(enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
-        QueryClassificationConfig { enabled, rules }
+        QueryClassificationConfig {
+            enabled,
+            rules,
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 30,
+        }
     }
 
     #[test]

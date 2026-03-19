@@ -162,6 +162,259 @@ impl ClaudeCodeProvider {
         (None, message)
     }
 
+    fn extract_tmux_target(message: &str) -> (Option<String>, &str) {
+        if let Some(rest) = message.strip_prefix("[ZEROCLAW_TMUX_TARGET:") {
+            if let Some(end) = rest.find(']') {
+                let target = rest[..end].trim();
+                if !target.is_empty() {
+                    let remainder = rest[end + 1..].trim_start_matches('\n');
+                    return (Some(target.to_string()), remainder);
+                }
+            }
+        }
+        (None, message)
+    }
+
+    /// Check if a line looks like Claude Code's interactive prompt (idle, ready for input).
+    fn is_claude_prompt_line(line: &str) -> bool {
+        let trimmed = line.trim();
+        // Claude Code uses ❯ (U+276F) as its prompt character
+        trimmed == "\u{276F}"
+            || trimmed.starts_with("\u{276F} ")
+            || trimmed == ">"
+            || trimmed.ends_with("> ")
+            || (trimmed.ends_with('>') && !trimmed.contains('<') && !trimmed.contains("```"))
+    }
+
+    /// Capture the contents of a tmux pane (last 500 lines of scrollback).
+    async fn tmux_capture_pane(target: &str) -> anyhow::Result<String> {
+        let output = tokio::process::Command::new("tmux")
+            .args(["capture-pane", "-t", target, "-p", "-S", "-500"])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to capture tmux pane '{}': {}", target, e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "tmux capture-pane failed for '{}': {}",
+                target,
+                stderr.trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Send a message to a tmux pane. Uses `set-buffer` + `paste-buffer` for
+    /// reliable delivery regardless of message length, then sends Enter.
+    async fn tmux_send_keys(target: &str, message: &str) -> anyhow::Result<()> {
+        // Collapse to a single line — Claude Code interactive mode accepts single-line input.
+        let oneline = message.replace('\n', " ");
+
+        // set-buffer sets the content directly (no file needed), then paste into target pane.
+        let set = tokio::process::Command::new("tmux")
+            .args(["set-buffer", &oneline])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("tmux set-buffer failed: {}", e))?;
+        if !set.status.success() {
+            let stderr = String::from_utf8_lossy(&set.stderr);
+            anyhow::bail!("tmux set-buffer failed: {}", stderr.trim());
+        }
+
+        let paste = tokio::process::Command::new("tmux")
+            .args(["paste-buffer", "-t", target])
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("tmux paste-buffer failed: {}", e))?;
+        if !paste.status.success() {
+            let stderr = String::from_utf8_lossy(&paste.stderr);
+            anyhow::bail!("tmux paste-buffer failed for '{}': {}", target, stderr.trim());
+        }
+
+        // Press Enter to submit
+        let enter = tokio::process::Command::new("tmux")
+            .args(["send-keys", "-t", target, "Enter"])
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to send Enter to tmux pane '{}': {}", target, e)
+            })?;
+        if !enter.status.success() {
+            let stderr = String::from_utf8_lossy(&enter.stderr);
+            anyhow::bail!(
+                "tmux send-keys Enter failed for '{}': {}",
+                target,
+                stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    /// Check if a line is Claude Code UI chrome (separator, status bar, etc.).
+    fn is_chrome_line(line: &str) -> bool {
+        let trimmed = line.trim();
+        // Full-width separator lines (────) — only match lines that are purely ─ chars
+        // and long enough to be a UI separator (not a table border which mixes │┼├ etc.)
+        if trimmed.len() > 40
+            && trimmed.chars().all(|c| c == '\u{2500}')
+        {
+            return true;
+        }
+        // Status bar lines (context %, timer, model info)
+        if trimmed.contains("context]") || trimmed.contains("bypass permissions") {
+            return true;
+        }
+        // Progress bar patterns
+        if trimmed.contains('\u{2591}') || trimmed.contains('\u{2588}') {
+            return true;
+        }
+        false
+    }
+
+    /// Extract Claude's response from before/after pane snapshots.
+    fn extract_tmux_response(before: &str, after: &str, sent_message: &str) -> String {
+        let after_lines: Vec<&str> = after.lines().collect();
+
+        if after_lines.len() <= before.lines().count() {
+            return String::new();
+        }
+
+        let sent_trimmed = sent_message.trim();
+
+        // Find where the new content starts by looking for the echoed prompt line.
+        // This is more reliable than counting lines since tmux may reuse screen space.
+        let before_lines: Vec<&str> = before.lines().collect();
+        let prompt_needle = format!("\u{276F} {}", sent_trimmed);
+        let new_start = after_lines
+            .iter()
+            .rposition(|line| line.trim() == prompt_needle.trim())
+            .map(|i| i + 1)
+            .unwrap_or(before_lines.len());
+
+        if new_start >= after_lines.len() {
+            return String::new();
+        }
+
+        let new_lines = &after_lines[new_start..];
+
+        // Filter out Claude Code UI chrome and extract just the response text.
+        // Lines starting with ⏺ are Claude's output markers — keep the content after ⏺.
+        let mut result: Vec<String> = Vec::new();
+        for line in new_lines {
+            let trimmed = line.trim();
+
+            // Skip prompt lines, chrome, tool calls, and tool output — but don't break,
+            // since Claude interleaves tool calls with response text.
+            if Self::is_claude_prompt_line(trimmed) || Self::is_chrome_line(trimmed) {
+                continue;
+            }
+
+            // Strip the ⏺ marker prefix
+            if let Some(rest) = trimmed.strip_prefix('\u{23FA}') {
+                let content = rest.trim();
+                // Skip tool call lines like "Bash(command)"
+                if content.starts_with("Bash(") || content.starts_with("Read(")
+                    || content.starts_with("Write(") || content.starts_with("Edit(")
+                    || content.starts_with("Glob(") || content.starts_with("Grep(")
+                    || content.starts_with("Web Search(")
+                    || content.starts_with("Searched for")
+                {
+                    continue;
+                }
+                if !content.is_empty() {
+                    result.push(content.to_string());
+                }
+                continue;
+            }
+
+            // Skip tool output lines (⎿ prefix) and expand markers
+            if trimmed.starts_with('\u{23BF}') || trimmed.contains("ctrl+o to expand") {
+                continue;
+            }
+            // Skip +N lines markers and "Read N file" markers
+            if trimmed.starts_with("\u{2026}") || trimmed.starts_with("… +") {
+                continue;
+            }
+            if trimmed.starts_with("Read ") && trimmed.contains("file") {
+                continue;
+            }
+            // Skip "Did N search" markers
+            if trimmed.starts_with("Did ") && trimmed.contains("search") {
+                continue;
+            }
+
+            result.push(trimmed.to_string());
+        }
+
+        // Trim trailing empty lines and any remaining chrome at the end
+        while result.last().is_some_and(|l| {
+            let t = l.trim();
+            t.is_empty() || Self::is_claude_prompt_line(t) || Self::is_chrome_line(t)
+        }) {
+            result.pop();
+        }
+
+        result.join("\n").trim().to_string()
+    }
+
+    /// Route a message through an interactive Claude session in a tmux pane.
+    async fn invoke_tmux(&self, target: &str, message: &str) -> anyhow::Result<String> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+        const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+        // Snapshot pane before sending
+        let before = Self::tmux_capture_pane(target).await?;
+
+        // Send the prompt
+        Self::tmux_send_keys(target, message).await?;
+        tracing::info!(target, "Sent prompt to tmux pane");
+
+        // Poll until response completes (prompt reappears and output stabilizes)
+        let deadline = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
+        let mut last_snapshot = before.clone();
+        let mut stable_count: u32 = 0;
+
+        loop {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            if tokio::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "Tmux Claude session at '{}' did not respond within {:?}",
+                    target,
+                    RESPONSE_TIMEOUT,
+                );
+            }
+
+            let snapshot = Self::tmux_capture_pane(target).await?;
+
+            // Check if output has new content beyond the before snapshot
+            let has_new_content = snapshot.lines().count() > before.lines().count();
+
+            // Check if the prompt has reappeared near the end.
+            // Claude Code's status bar occupies the last few lines, so check
+            // the last 5 lines for the ❯ prompt.
+            let ends_with_prompt = snapshot
+                .trim_end()
+                .lines()
+                .rev()
+                .take(5)
+                .any(Self::is_claude_prompt_line);
+
+            if has_new_content && ends_with_prompt && snapshot == last_snapshot {
+                stable_count += 1;
+                if stable_count >= 2 {
+                    let response = Self::extract_tmux_response(&before, &snapshot, message);
+                    tracing::info!(target, len = response.len(), "Captured tmux response");
+                    return Ok(response);
+                }
+            } else {
+                stable_count = 0;
+            }
+
+            last_snapshot = snapshot;
+        }
+    }
+
     fn get_session(&self, key: &str) -> Option<String> {
         self.sessions.lock().ok()?.get(key).cloned()
     }
@@ -389,6 +642,19 @@ impl ClaudeCodeProvider {
     async fn invoke_cli(&self, message: &str, model: &str) -> anyhow::Result<String> {
         let (cwd, message) = Self::extract_cwd(message);
         let (session_key, message) = Self::extract_session_key(message);
+        let (tmux_target, message) = Self::extract_tmux_target(message);
+
+        // Route through tmux if configured for this channel.
+        // chat_with_history already stripped system prompt/history for tmux messages.
+        if let Some(ref target) = tmux_target {
+            tracing::info!(
+                target = target,
+                msg_len = message.len(),
+                msg_preview = &message[..message.len().min(100)],
+                "Tmux routing: sending user message"
+            );
+            return self.invoke_tmux(target, message).await;
+        }
 
         let resume_id = session_key.as_ref().and_then(|k| self.get_session(k));
 
@@ -658,6 +924,26 @@ impl Provider for ClaudeCodeProvider {
             .as_ref()
             .and_then(|k| self.get_session(k))
             .is_some();
+
+        // Check if this message has a tmux target directive.
+        // If so, send only the directives + raw user message (no system prompt/history).
+        let has_tmux = system
+            .map_or(false, |s| s.contains("[ZEROCLAW_TMUX_TARGET:"));
+        if has_tmux {
+            // Extract just the directives from the system prompt and pair with user message.
+            let sys = system.unwrap_or("");
+            let mut directives = String::new();
+            for line in sys.lines() {
+                if line.starts_with("[ZEROCLAW_") {
+                    directives.push_str(line);
+                    directives.push('\n');
+                } else {
+                    break;
+                }
+            }
+            directives.push_str(last_user);
+            return self.invoke_cli(&directives, model).await;
+        }
 
         // When --resume is available, the CLI already has the full
         // conversation context — just send the latest message.

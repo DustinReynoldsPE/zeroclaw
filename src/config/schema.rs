@@ -93,6 +93,14 @@ pub struct Config {
     #[serde(default)]
     pub channel_workspaces: HashMap<String, String>,
 
+    /// Map channel identifiers to tmux window targets for interactive Claude Code routing.
+    /// When a message arrives from a mapped channel using the claude-code provider,
+    /// the prompt is sent to the specified tmux pane instead of spawning a subprocess.
+    /// The tmux pane must have an interactive `claude` session running.
+    /// Example: `{ "!roomABC:server" = "main:zeroclaw" }`
+    #[serde(default)]
+    pub tmux_targets: HashMap<String, String>,
+
     /// Map channel identifiers to provider+model overrides.
     /// Enables per-room provider routing (e.g. one Matrix room uses local llama.cpp).
     /// Example: `{ "!roomXYZ:server" = { provider = "custom:http://localhost:8080", model = "qwen" } }`
@@ -3359,9 +3367,24 @@ pub struct QueryClassificationConfig {
     /// Enable automatic query classification. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Classification rules evaluated in priority order.
+    /// Classification rules evaluated in priority order (static fallback).
     #[serde(default)]
     pub rules: Vec<ClassificationRule>,
+    /// Provider for intelligent model-based classification (e.g. "ollama", "claude-code").
+    /// When set, a lightweight model call classifies messages before falling back to static rules.
+    #[serde(default)]
+    pub classifier_provider: Option<String>,
+    /// Model for intelligent classification (e.g. "qwen3:4b", "haiku").
+    #[serde(default)]
+    pub classifier_model: Option<String>,
+    /// Timeout in seconds for model-based classification. Default: 30.
+    /// Set high enough for local models that may need warm-up time.
+    #[serde(default = "default_classifier_timeout")]
+    pub classifier_timeout_secs: u64,
+}
+
+fn default_classifier_timeout() -> u64 {
+    30
 }
 
 /// A single classification rule mapping message patterns to a model hint.
@@ -5273,6 +5296,7 @@ impl Default for Config {
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             default_temperature: default_temperature(),
             provider_timeout_secs: default_provider_timeout_secs(),
@@ -7512,6 +7536,7 @@ default_temperature = 0.7
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             default_temperature: 0.5,
             provider_timeout_secs: 120,
@@ -7884,6 +7909,7 @@ tool_dispatcher = "xml"
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             default_temperature: 0.9,
             provider_timeout_secs: 120,
@@ -9253,6 +9279,7 @@ requires_openai_auth = true
             api_url: None,
             api_key: Some("ollama-key".to_string()),
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             ..Config::default()
         };
@@ -9272,6 +9299,7 @@ requires_openai_auth = true
             api_url: Some("https://ollama.com/api".to_string()),
             api_key: None,
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             ..Config::default()
         };
@@ -9302,6 +9330,7 @@ requires_openai_auth = true
                 },
             )]),
             channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
             channel_providers: HashMap::new(),
             ..Config::default()
         };

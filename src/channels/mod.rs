@@ -315,6 +315,8 @@ struct ChannelRuntimeContext {
     workspace_dir: Arc<PathBuf>,
     /// Maps channel identifiers (e.g. Matrix room IDs) to local workspace paths.
     channel_workspace_map: Arc<HashMap<String, PathBuf>>,
+    /// Maps channel identifiers to tmux window targets for interactive Claude Code routing.
+    channel_tmux_targets: Arc<HashMap<String, String>>,
     /// Maps channel identifiers to provider+model overrides for per-room routing.
     channel_provider_map: Arc<HashMap<String, crate::config::schema::ChannelProviderOverride>>,
     message_timeout_secs: u64,
@@ -1873,8 +1875,29 @@ async fn process_channel_message(
     }
 
     // ── Query classification: override route when a rule matches ──
-    if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
-    {
+    let classification_hint = if let (Some(ref cls_provider), Some(ref cls_model)) = (
+        ctx.query_classification.classifier_provider.as_ref(),
+        ctx.query_classification.classifier_model.as_ref(),
+    ) {
+        // Model-based classification: use a lightweight model to classify the message.
+        let available_hints: Vec<String> = ctx.model_routes.iter().map(|r| r.hint.clone()).collect();
+        if let Ok(provider) = get_or_create_provider(ctx.as_ref(), cls_provider).await {
+            crate::agent::classifier::classify_with_model(
+                &ctx.query_classification,
+                &msg.content,
+                provider,
+                cls_model,
+                &available_hints,
+            )
+            .await
+        } else {
+            crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+        }
+    } else {
+        crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+    };
+
+    if let Some(hint) = classification_hint {
         if let Some(matched_route) = ctx
             .model_routes
             .iter()
@@ -2030,18 +2053,49 @@ async fn process_channel_message(
     // Inject session key so the claude-code provider can persist/resume sessions per room.
     let session_key_prefix = format!("[ZEROCLAW_SESSION_KEY:{}]\n", room_id_for_ws);
 
+    // Resolve tmux target for this channel (if configured).
+    // Activate tmux routing when the message starts with a recognized prefix.
+    let tmux_prefixes: &[&str] = &[">> ", "TMUX ", "tmux "];
+    let tmux_prefix_match = tmux_prefixes
+        .iter()
+        .find(|p| msg.content.starts_with(*p))
+        .copied();
+    let tmux_target = if tmux_prefix_match.is_some() {
+        ctx.channel_tmux_targets
+            .get(room_id_for_ws)
+            .or_else(|| ctx.channel_tmux_targets.get(&msg.channel))
+            .cloned()
+    } else {
+        None
+    };
+    let is_tmux_routed = tmux_target.is_some();
+    let user_content = if let (true, Some(prefix)) = (is_tmux_routed, tmux_prefix_match) {
+        msg.content[prefix.len()..].to_string()
+    } else {
+        msg.content.clone()
+    };
+
     let system_prompt = {
         let mut s = String::new();
         if let Some(prefix) = workspace_prefix {
             s.push_str(&prefix);
         }
         s.push_str(&session_key_prefix);
+        if let Some(ref target) = tmux_target {
+            s.push_str(&format!("[ZEROCLAW_TMUX_TARGET:{}]\n", target));
+        }
         s.push_str(&system_prompt);
         s
     };
 
+    // Tmux-routed rooms: skip history — the interactive Claude session has its own context.
+    // Still include the current user message so the provider can forward it.
     let mut history = vec![ChatMessage::system(system_prompt)];
-    history.extend(prior_turns);
+    if is_tmux_routed {
+        history.push(ChatMessage::user(&user_content));
+    } else {
+        history.extend(prior_turns);
+    }
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2334,6 +2388,19 @@ async fn process_channel_message(
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
+            };
+
+            // Append model tag so the user knows which tier answered.
+            let model_label = match route.model.as_str() {
+                "haiku" => "haiku",
+                "sonnet" => "sonnet",
+                "default" | "" => "opus",
+                other => other,
+            };
+            let delivered_response = if is_tmux_routed {
+                delivered_response
+            } else {
+                format!("{delivered_response}\n\n`{model_label}`")
             };
             runtime_trace::record_event(
                 "channel_message_outbound",
@@ -4060,6 +4127,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 .map(|(k, v)| (k.clone(), PathBuf::from(v)))
                 .collect(),
         ),
+        channel_tmux_targets: Arc::new(config.tmux_targets.clone()),
         channel_provider_map: Arc::new(config.channel_providers.clone()),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -4385,6 +4453,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4496,6 +4565,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4563,6 +4633,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -4649,6 +4720,7 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -5179,6 +5251,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5254,6 +5327,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5343,6 +5417,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5417,6 +5492,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5501,6 +5577,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5605,6 +5682,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5691,6 +5769,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5792,6 +5871,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5878,6 +5958,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -5954,6 +6035,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6141,6 +6223,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6236,6 +6319,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6346,6 +6430,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6453,6 +6538,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6542,6 +6628,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -6616,6 +6703,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7248,6 +7336,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7348,6 +7437,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -7448,6 +7538,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8012,6 +8103,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8093,6 +8185,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8248,6 +8341,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8353,6 +8447,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8450,6 +8545,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
@@ -8567,6 +8663,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
             channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {

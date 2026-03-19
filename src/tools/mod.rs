@@ -45,6 +45,10 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix_history;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix_rooms;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -104,6 +108,10 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+#[cfg(feature = "channel-matrix")]
+pub use matrix_history::MatrixHistoryTool;
+#[cfg(feature = "channel-matrix")]
+pub use matrix_rooms::MatrixRoomsTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -431,6 +439,20 @@ pub fn all_tools_with_runtime(
     if root_config.cloud_ops.enabled {
         tool_arcs.push(Arc::new(CloudOpsTool::new(root_config.cloud_ops.clone())));
         tool_arcs.push(Arc::new(CloudPatternsTool::new()));
+    }
+
+    // Matrix room history tool (feature-gated)
+    #[cfg(feature = "channel-matrix")]
+    if let Some(ref mx) = root_config.channels_config.matrix {
+        tool_arcs.push(Arc::new(MatrixHistoryTool::new(
+            mx.homeserver.clone(),
+            mx.access_token.clone(),
+            Some(mx.room_id.clone()),
+        )));
+        tool_arcs.push(Arc::new(MatrixRoomsTool::new(
+            mx.homeserver.clone(),
+            mx.access_token.clone(),
+        )));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
