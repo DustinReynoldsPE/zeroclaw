@@ -1,6 +1,6 @@
 ---
 id: matrix-room-history-6fdb
-stage: triage
+stage: done
 deps: []
 links: []
 created: 2026-03-20T13:58:37Z
@@ -8,10 +8,10 @@ type: task
 priority: 2
 assignee: Dustin Reynolds
 tags: [matrix, tools, channels]
-version: 1
+skipped: [implement, test, verify]
+version: 2
 ---
 # Matrix room history not accessible to LLM agent
-
 
 The LLM agent cannot read Matrix room message history when asked to review a room. Three blockers:
 

@@ -329,6 +329,93 @@ impl MatrixChannel {
         !body.trim().is_empty()
     }
 
+    fn is_help_command(body: &str) -> bool {
+        let t = body.trim().to_lowercase();
+        t == "help" || t == "!help" || t == "/help" || t == "commands" || t == "!commands"
+    }
+
+    fn handle_help_command() -> String {
+        [
+            "**Zero-token commands** _(no LLM, instant)_",
+            "",
+            "**usage** — Claude Code quota bars with reset dates",
+            "**peek** `[N]` — last N lines of this room's tmux pane (default 20)",
+            "**history** `[N]` — last N Matrix messages in this room (default 10)",
+            "**ticket** `<subcommand>` — ticket management (`ticket help` for details)",
+            "**tmux** `<text>` — send text directly to the tmux pane for this room",
+            "**help** / **commands** — this help",
+            "",
+            "Prefix any other message to route to the agent.",
+        ]
+        .join("\n")
+    }
+
+    fn is_history_command(body: &str) -> bool {
+        let t = body.trim().to_lowercase();
+        t == "history"
+            || t == "!history"
+            || t.starts_with("history ")
+            || t.starts_with("!history ")
+    }
+
+    async fn fetch_room_messages(
+        http_client: &reqwest::Client,
+        homeserver: &str,
+        access_token: &str,
+        room_id: &str,
+        limit: u64,
+    ) -> String {
+        let encoded = urlencoding::encode(room_id).into_owned();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}",
+            homeserver.trim_end_matches('/'),
+            encoded,
+            limit
+        );
+        let resp = match http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return format!("Failed to fetch history: {e}"),
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return format!("Failed to parse history: {e}"),
+        };
+        let chunks = match json.get("chunk").and_then(|c| c.as_array()) {
+            Some(v) => v,
+            None => return "No messages found.".to_string(),
+        };
+        let mut lines = Vec::new();
+        for ev in chunks.iter().rev() {
+            if ev.get("type").and_then(|t| t.as_str()) != Some("m.room.message") {
+                continue;
+            }
+            let sender = ev.get("sender").and_then(|s| s.as_str()).unwrap_or("?");
+            let sender_short = sender.trim_start_matches('@').split(':').next().unwrap_or(sender);
+            let body = ev
+                .get("content")
+                .and_then(|c| c.get("body"))
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            lines.push(format!("**{}**: {}", sender_short, body));
+        }
+        if lines.is_empty() {
+            "No recent messages.".to_string()
+        } else {
+            format!("**Room history** (last {}):\n\n{}", lines.len(), lines.join("\n"))
+        }
+    }
+
     fn is_usage_command(body: &str) -> bool {
         let trimmed = body.trim().to_lowercase();
         trimmed == "usage"
@@ -404,7 +491,7 @@ impl MatrixChannel {
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| {
                     let local = dt.with_timezone(&chrono::Local);
-                    local.format("Resets %I:%M%P").to_string()
+                    local.format("Resets %b %-d at %-I:%M%P").to_string()
                 })
                 .unwrap_or_else(|| "No reset info".to_string())
         };
@@ -1652,6 +1739,7 @@ impl Channel for MatrixChannel {
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
+        let http_client_for_handler = self.http_client.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_config_for_handler = self.transcription_config.clone();
 
@@ -1663,6 +1751,7 @@ impl Channel for MatrixChannel {
             let dedupe = Arc::clone(&dedupe_for_handler);
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
+            let http_client = http_client_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let transcription_config = transcription_config_for_handler.clone();
 
@@ -1831,35 +1920,66 @@ impl Channel for MatrixChannel {
                     tracing::warn!("Matrix failed to send read receipt: {error}");
                 }
 
+                // Helper: send a zero-token reply and return early.
+                macro_rules! send_zero_token {
+                    ($text:expr, $label:expr) => {{
+                        let mut content = RoomMessageEventContent::text_markdown(&$text);
+                        if let Some(ref thread_ts) = match &event.content.relates_to {
+                            Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
+                            _ => None,
+                        } {
+                            if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                                content.relates_to = Some(Relation::Thread(Thread::plain(
+                                    thread_root.clone(),
+                                    thread_root,
+                                )));
+                            }
+                        }
+                        if let Err(e) = room.send(content).await {
+                            tracing::warn!("Matrix failed to send {} result: {}", $label, e);
+                        } else {
+                            tracing::info!("Matrix {} command executed", $label);
+                        }
+                        if let Err(error) = room.typing_notice(false).await {
+                            tracing::warn!("Matrix failed to stop typing notification: {error}");
+                        }
+                        return;
+                    }};
+                }
+
                 // Check for usage command (zero-token operation)
                 if MatrixChannel::is_usage_command(&body) {
-                    let usage_result = MatrixChannel::handle_usage_command().await;
-                    let mut content = RoomMessageEventContent::text_markdown(&usage_result);
+                    let result = MatrixChannel::handle_usage_command().await;
+                    send_zero_token!(result, "usage");
+                }
 
-                    if let Some(ref thread_ts) = match &event.content.relates_to {
-                        Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
-                        _ => None,
-                    } {
-                        if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
-                            content.relates_to = Some(Relation::Thread(Thread::plain(
-                                thread_root.clone(),
-                                thread_root,
-                            )));
-                        }
-                    }
+                // Check for help/commands command (zero-token operation)
+                if MatrixChannel::is_help_command(&body) {
+                    let result = MatrixChannel::handle_help_command();
+                    send_zero_token!(result, "help");
+                }
 
-                    if let Err(e) = room.send(content).await {
-                        tracing::warn!("Matrix failed to send usage result: {}", e);
-                    } else {
-                        tracing::info!("Matrix usage command executed");
-                    }
-
-                    // Stop typing notification
-                    if let Err(error) = room.typing_notice(false).await {
-                        tracing::warn!("Matrix failed to stop typing notification: {error}");
-                    }
-
-                    return;
+                // Check for history command (zero-token operation)
+                if MatrixChannel::is_history_command(&body) {
+                    let limit: u64 = body
+                        .trim()
+                        .to_lowercase()
+                        .trim_start_matches('!')
+                        .trim_start_matches("history")
+                        .trim()
+                        .parse()
+                        .unwrap_or(10)
+                        .min(50);
+                    let room_id_str = room.room_id().as_str();
+                    let result = MatrixChannel::fetch_room_messages(
+                        &http_client,
+                        &homeserver,
+                        &access_token,
+                        room_id_str,
+                        limit,
+                    )
+                    .await;
+                    send_zero_token!(result, "history");
                 }
 
                 // Start typing notification while processing begins

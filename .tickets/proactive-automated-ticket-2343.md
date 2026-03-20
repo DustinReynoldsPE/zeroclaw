@@ -1,6 +1,6 @@
 ---
 id: proactive-automated-ticket-2343
-stage: triage
+stage: done
 deps: []
 links: []
 created: 2026-03-20T13:53:29Z
@@ -8,10 +8,10 @@ type: task
 priority: 2
 assignee: Dustin Reynolds
 tags: [scheduler, tickets, automation]
-version: 1
+skipped: [implement, test, verify]
+version: 2
 ---
 # Proactive automated ticket triage and progression via scheduler
-
 
 The system should periodically check for tickets that need attention without waiting for user prompts.
 

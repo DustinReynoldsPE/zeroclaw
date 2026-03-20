@@ -574,6 +574,94 @@ pub async fn handle_api_cost(
     }
 }
 
+/// GET /api/matrix/rooms/{roomId}/messages?limit=N
+///
+/// Fetch recent messages from a Matrix room using the daemon's decrypted access token.
+/// The room must be in the configured allowed rooms list. Limit defaults to 20, max 100.
+#[derive(Deserialize)]
+pub struct MatrixMessagesQuery {
+    limit: Option<u64>,
+}
+
+pub async fn handle_api_matrix_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(room_id): Path<String>,
+    Query(query): Query<MatrixMessagesQuery>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Extract needed values from config while holding the lock, then drop before any await.
+    let extracted = {
+        let config = state.config.lock();
+        let mx = match config.channels_config.matrix.as_ref() {
+            Some(m) => m,
+            None => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Matrix channel not configured"})),
+                )
+                    .into_response();
+            }
+        };
+        let allowed: std::collections::HashSet<String> = std::iter::once(mx.room_id.clone())
+            .chain(mx.room_ids.iter().cloned())
+            .chain(config.channel_workspaces.keys().cloned())
+            .collect();
+        Some((
+            mx.homeserver.trim_end_matches('/').to_string(),
+            mx.access_token.clone(),
+            allowed,
+        ))
+    };
+
+    let (homeserver, access_token, allowed) = extracted.unwrap();
+
+    if !allowed.contains(&room_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "Room not in allowed list"})),
+        )
+            .into_response();
+    }
+
+    let limit = query.limit.unwrap_or(20).min(100);
+
+    let encoded = urlencoding::encode(&room_id).into_owned();
+    let url = format!(
+        "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}",
+        homeserver, encoded, limit
+    );
+
+    let client = reqwest::Client::new();
+    let resp = match client
+        .get(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({"error": format!("Matrix request failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match resp.json::<serde_json::Value>().await {
+        Ok(body) => Json(body).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({"error": format!("Matrix response parse failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/cli-tools — discovered CLI tools
 pub async fn handle_api_cli_tools(
     State(state): State<AppState>,
