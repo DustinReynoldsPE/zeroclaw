@@ -321,11 +321,12 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
 
-    deliver_announcement(config, channel, target, output).await
+    deliver_announcement(config, delivery, channel, target, output).await
 }
 
 pub(crate) async fn deliver_announcement(
     config: &Config,
+    delivery: &DeliveryConfig,
     channel: &str,
     target: &str,
     output: &str,
@@ -416,14 +417,29 @@ pub(crate) async fn deliver_announcement(
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("matrix channel not configured"))?;
                 let room_id = resolve_matrix_delivery_room(&mx.room_id, target);
+                // Use override token/user_id (e.g. cron-bot) when provided,
+                // otherwise fall back to the configured channel credentials.
+                // When overriding, pass None for device_id so matrix-sdk opens
+                // a fresh session rather than restoring the stored zeroclaw session.
+                let (access_token, user_id, device_id, zeroclaw_dir) =
+                    if let Some(tok) = delivery.token.clone() {
+                        (tok, delivery.user_id.clone(), None, None)
+                    } else {
+                        (
+                            mx.access_token.clone(),
+                            mx.user_id.clone(),
+                            mx.device_id.clone(),
+                            config.config_path.parent().map(|p| p.to_path_buf()),
+                        )
+                    };
                 let channel = MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                     mx.homeserver.clone(),
-                    mx.access_token.clone(),
+                    access_token,
                     room_id,
                     mx.allowed_users.clone(),
-                    mx.user_id.clone(),
-                    mx.device_id.clone(),
-                    config.config_path.parent().map(|path| path.to_path_buf()),
+                    user_id,
+                    device_id,
+                    zeroclaw_dir,
                 );
                 channel.send(&SendMessage::new(output, target)).await?;
             }
@@ -980,6 +996,8 @@ mod tests {
                 channel: Some("telegram".into()),
                 to: Some("123456".into()),
                 best_effort: false,
+                token: None,
+                user_id: None,
             }),
             false,
         )
@@ -1018,6 +1036,8 @@ mod tests {
                 channel: Some("telegram".into()),
                 to: Some("123456".into()),
                 best_effort: true,
+                token: None,
+                user_id: None,
             }),
             false,
         )
@@ -1078,6 +1098,8 @@ mod tests {
             channel: Some("invalid".into()),
             to: Some("target".into()),
             best_effort: true,
+            token: None,
+            user_id: None,
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
@@ -1110,6 +1132,8 @@ mod tests {
             channel: Some("matrix".into()),
             to: Some("!ops:matrix.org".into()),
             best_effort: false,
+            token: None,
+            user_id: None,
         };
 
         let err = deliver_if_configured(&config, &job, "hello")
@@ -1129,6 +1153,8 @@ mod tests {
             channel: Some("matrix".into()),
             to: Some("!ops:matrix.org".into()),
             best_effort: false,
+            token: None,
+            user_id: None,
         };
 
         let err = deliver_if_configured(&config, &job, "hello")

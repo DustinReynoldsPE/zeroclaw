@@ -114,6 +114,22 @@ pub(crate) fn add_job(config: &Config, expression: &str, command: &str) -> Resul
     add_shell_job(config, None, schedule, command)
 }
 
+fn build_delivery(
+    announce_to: Option<String>,
+    channel: Option<String>,
+    token: Option<String>,
+    user_id: Option<String>,
+) -> Option<DeliveryConfig> {
+    announce_to.map(|to| DeliveryConfig {
+        mode: "announce".to_string(),
+        channel,
+        to: Some(to),
+        best_effort: true,
+        token,
+        user_id,
+    })
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
@@ -153,6 +169,10 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             expression,
             tz,
             agent,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             let schedule = Schedule::Cron {
@@ -160,6 +180,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 tz,
             };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -167,7 +189,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                 )?;
                 println!("✅ Added agent cron job {}", job.id);
@@ -183,12 +205,22 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             }
             Ok(())
         }
-        crate::CronCommands::AddAt { at, agent, command } => {
+        crate::CronCommands::AddAt {
+            at,
+            agent,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
+            command,
+        } => {
             let at = chrono::DateTime::parse_from_rfc3339(&at)
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -196,7 +228,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                 )?;
                 println!("✅ Added one-shot agent cron job {}", job.id);
@@ -213,10 +245,16 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         crate::CronCommands::AddEvery {
             every_ms,
             agent,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             let schedule = Schedule::Every { every_ms };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -224,7 +262,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                 )?;
                 println!("✅ Added interval agent cron job {}", job.id);
@@ -243,12 +281,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         crate::CronCommands::Once {
             delay,
             agent,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             if agent {
                 let duration = parse_delay(&delay)?;
                 let at = chrono::Utc::now() + duration;
                 let schedule = Schedule::At { at };
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -256,7 +300,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                 )?;
                 println!("✅ Added one-shot agent cron job {}", job.id);
@@ -775,6 +819,10 @@ mod tests {
                 expression: "*/15 * * * *".into(),
                 tz: None,
                 agent: true,
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -805,6 +853,10 @@ mod tests {
                 expression: "*/15 * * * *".into(),
                 tz: None,
                 agent: true,
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -826,6 +878,10 @@ mod tests {
                 expression: "*/5 * * * *".into(),
                 tz: None,
                 agent: false,
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "echo ok".into(),
             },
             &config,
