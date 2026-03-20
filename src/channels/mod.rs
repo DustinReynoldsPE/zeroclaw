@@ -1278,6 +1278,84 @@ const TICKET_SUBCOMMANDS: &[&str] = &[
     "closed", "create", "help",
 ];
 
+fn is_peek_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "peek"
+        || lower.starts_with("peek ")
+        || lower == "!peek"
+        || lower.starts_with("!peek ")
+}
+
+async fn handle_peek_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_peek_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let room_id = extract_room_id(&msg.reply_target);
+    let tmux_target = ctx
+        .channel_tmux_targets
+        .get(room_id)
+        .or_else(|| ctx.channel_tmux_targets.get(&msg.channel))
+        .cloned();
+
+    let response = match tmux_target {
+        None => "No tmux target configured for this room.".to_string(),
+        Some(target) => {
+            // Parse optional line count: "peek 30" → last 30 lines (default 50)
+            let lines: usize = msg
+                .content
+                .trim()
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50)
+                .min(200);
+
+            match tokio::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", &target])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    let raw = String::from_utf8_lossy(&out.stdout);
+                    let visible: Vec<&str> = raw
+                        .lines()
+                        .rev()
+                        .take(lines)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    if visible.iter().all(|l| l.trim().is_empty()) {
+                        format!("`{target}` — pane is empty.")
+                    } else {
+                        format!("`{target}`\n```\n{}\n```", visible.join("\n"))
+                    }
+                }
+                Ok(_) => format!("Pane `{target}` not found."),
+                Err(e) => format!("tmux error: {e}"),
+            }
+        }
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send peek response: {err}");
+    }
+
+    true
+}
+
 fn is_ticket_command(content: &str) -> bool {
     let lower = content.trim().to_lowercase();
     lower == "ticket"
@@ -2314,6 +2392,9 @@ async fn process_channel_message(
         return;
     }
     if handle_ticket_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_peek_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
 
@@ -9222,6 +9303,18 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[test]
+    fn peek_command_detection() {
+        assert!(is_peek_command("peek"));
+        assert!(is_peek_command("Peek"));
+        assert!(is_peek_command("PEEK"));
+        assert!(is_peek_command("peek 30"));
+        assert!(is_peek_command("!peek"));
+        assert!(!is_peek_command("peekaboo"));
+        assert!(!is_peek_command("take a peek"));
+        assert!(!is_peek_command(""));
     }
 
     #[test]
