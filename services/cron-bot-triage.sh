@@ -2,10 +2,11 @@
 # cron-bot-triage.sh — zero-token per-room triage poster
 #
 # For a given Matrix room:
-#   1. Check tmux pane for pending Claude Code question — notify immediately if found
-#   2. Check idle state + dedup (via cron-bot-idle-check.py) — skip ticket post if not needed
-#   3. Run `tk list` — collect open tickets
-#   4. Format a markdown summary and POST to Matrix as cron-bot (no LLM)
+#   1. Check Claude Code quota (Anthropic OAuth endpoint) — skip triage if exhausted
+#   2. Check tmux pane for pending Claude Code question — notify immediately if found
+#   3. Check idle state + dedup (via cron-bot-idle-check.py) — skip ticket post if not needed
+#   4. Run `tk list` — collect open tickets
+#   5. Format a markdown summary and POST to Matrix as cron-bot (no LLM)
 #
 # Usage:
 #   ./services/cron-bot-triage.sh <room_id> [ticket_dir]
@@ -76,7 +77,22 @@ print(json.dumps({'msgtype': 'm.text', 'body': msg}))
     fi
 }
 
-# ── Step 1: Tmux pending-question check ────────────────────────────────────
+# ── Step 1: Usage quota check ──────────────────────────────────────────────
+# Skip triage (but not tmux alerts) if Claude Code quota is exhausted.
+USAGE_CHECK="$SCRIPT_DIR/usage-check.py"
+usage_exhausted="no"
+if [[ -f "$USAGE_CHECK" ]]; then
+    usage_json="$(python3 "$USAGE_CHECK" 2>/dev/null || echo "")"
+    if [[ -n "$usage_json" ]]; then
+        usage_exhausted="$(echo "$usage_json" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('yes' if d.get('exhausted') else 'no')
+" 2>/dev/null || echo "no")"
+    fi
+fi
+
+# ── Step 2: Tmux pending-question check ────────────────────────────────────
 # Look up the tmux target for this room from config.toml, then capture the
 # pane and check for patterns that indicate Claude Code is waiting for input.
 tmux_target=""
@@ -130,7 +146,12 @@ Claude Code appears to be waiting for input. Use \`peek\` to see the current sta
     fi
 fi
 
-# ── Step 2: Idle + dedup check ─────────────────────────────────────────────
+# ── Step 3: Idle + dedup check ─────────────────────────────────────────────
+# Skip ticket triage if usage is exhausted — tmux alerts above still fire.
+if [[ "$usage_exhausted" == "yes" ]]; then
+    exit 0
+fi
+
 IDLE_CHECK="$SCRIPT_DIR/cron-bot-idle-check.py"
 if [[ ! -f "$IDLE_CHECK" ]]; then
     echo "cron-bot-idle-check.py not found at $IDLE_CHECK" >&2
@@ -144,7 +165,7 @@ if [[ "$should_post" != "yes" ]]; then
     exit 0
 fi
 
-# ── Step 3: Collect ticket state ───────────────────────────────────────────
+# ── Step 4: Collect ticket state ───────────────────────────────────────────
 ticket_summary=""
 
 if command -v tk &>/dev/null && [[ -d "$TICKET_DIR" ]]; then
@@ -178,7 +199,7 @@ if [[ -z "$ticket_summary" ]]; then
     exit 0
 fi
 
-# ── Step 4: Format and post triage summary ─────────────────────────────────
+# ── Step 5: Format and post triage summary ─────────────────────────────────
 now_utc="$(date -u '+%Y-%m-%d %H:%M UTC')"
 message="**Triage Summary** — ${now_utc}
 
