@@ -81,16 +81,35 @@ pub(crate) fn tmux_is_claude_prompt_line(line: &str) -> bool {
         || (trimmed.ends_with('>') && !trimmed.contains('<') && !trimmed.contains("```"))
 }
 
-/// Check if a line is Claude Code UI chrome (separator, status bar, etc.).
+/// Check if a line is Claude Code UI chrome (separator, status bar, thinking, etc.).
 pub(crate) fn tmux_is_chrome_line(line: &str) -> bool {
     let trimmed = line.trim();
-    if trimmed.len() > 40 && trimmed.chars().all(|c| c == '\u{2500}') {
-        return true;
+    // Separator lines — mostly ─ (U+2500) chars, possibly with embedded text
+    if trimmed.len() > 40 {
+        let dash_count = trimmed.chars().filter(|&c| c == '\u{2500}').count();
+        if dash_count > 30 {
+            return true;
+        }
     }
+    // Status bar lines (context %, timer, model info, permissions)
     if trimmed.contains("context]") || trimmed.contains("bypass permissions") {
         return true;
     }
+    // Progress bar patterns
     if trimmed.contains('\u{2591}') || trimmed.contains('\u{2588}') {
+        return true;
+    }
+    // Thinking/reasoning indicators: "· Thinking…", "· Shimmying… (thought for 3s)"
+    if (trimmed.starts_with('\u{00B7}') || trimmed.starts_with("·"))
+        && (trimmed.contains("hinking")
+            || trimmed.contains("himmy")
+            || trimmed.contains("thought for")
+            || trimmed.contains("\u{2026}"))
+    {
+        return true;
+    }
+    // Status bar play/skip markers
+    if trimmed.starts_with("\u{23F5}") || trimmed.starts_with("\u{23F5}\u{23F5}") {
         return true;
     }
     false

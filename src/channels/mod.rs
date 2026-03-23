@@ -3200,7 +3200,6 @@ async fn process_channel_message(
     // Spawn live tmux pane streaming: sends filtered response text as new Matrix messages
     // while the provider polls the pane internally.
     let tmux_live_cancel = CancellationToken::new();
-    let tmux_live_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let tmux_live_task = if is_tmux_routed {
         if let (Some(ref tmux_tgt), Some(channel_ref)) = (&tmux_target, target_channel.as_ref()) {
             let target = tmux_tgt.clone();
@@ -3209,7 +3208,6 @@ async fn process_channel_message(
             let thread_ts = msg.thread_ts.clone();
             let sent_message = user_content.clone();
             let cancel = tmux_live_cancel.clone();
-            let sent_flag = Arc::clone(&tmux_live_sent);
             // Capture baseline before the provider sends the prompt — the provider
             // will take its own baseline, but we need ours before spawning.
             let baseline = crate::providers::claude_code::tmux_capture_pane(&target)
@@ -3248,7 +3246,6 @@ async fn process_channel_message(
                     if new_text.is_empty() {
                         continue;
                     }
-                    sent_flag.store(true, std::sync::atomic::Ordering::Relaxed);
                     let _ = channel
                         .send(
                             &SendMessage::new(&new_text, &reply_target)
@@ -3640,15 +3637,7 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                // When tmux live streaming already delivered content, skip the
-                // final response to avoid duplicating text the user already saw.
-                let tmux_already_sent =
-                    is_tmux_routed && tmux_live_sent.load(std::sync::atomic::Ordering::Relaxed);
-                if tmux_already_sent {
-                    tracing::info!(
-                        "Skipping final tmux response — live streaming already delivered"
-                    );
-                } else if let Some(ref draft_id) = draft_message_id {
+                if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
                         .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
