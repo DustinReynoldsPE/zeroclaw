@@ -422,8 +422,8 @@ pub(crate) async fn deliver_announcement(
                 // When overriding, pass None for device_id so matrix-sdk opens
                 // a fresh session rather than restoring the stored zeroclaw session.
                 let (access_token, user_id, device_id, zeroclaw_dir) =
-                    if let Some(tok) = delivery.token.clone() {
-                        (tok, delivery.user_id.clone(), None, None)
+                    if let Some(tok) = _delivery.token.clone() {
+                        (tok, _delivery.user_id.clone(), None, None)
                     } else {
                         (
                             mx.access_token.clone(),
