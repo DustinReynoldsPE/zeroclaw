@@ -101,7 +101,9 @@ pub(crate) fn tmux_is_chrome_line(line: &str) -> bool {
     }
     // Thinking/reasoning indicators using various bullet chars:
     // · (U+00B7), ✻ (U+273B), ✳ (U+2733), ✽ (U+273D), ● (U+25CF), ⏺ (U+23FA)
-    let thinking_prefixes = ['\u{00B7}', '\u{273B}', '\u{2733}', '\u{273D}', '\u{25CF}'];
+    let thinking_prefixes = [
+        '\u{00B7}', '\u{273B}', '\u{2733}', '\u{273D}', '\u{25CF}', '\u{2736}',
+    ];
     if thinking_prefixes.iter().any(|&c| trimmed.starts_with(c))
         && (trimmed.contains("hinking")
             || trimmed.contains("himmy")
@@ -457,15 +459,14 @@ impl ClaudeCodeProvider {
             // (pane height stays constant), so compare content directly.
             let has_new_content = snapshot != before;
 
-            // Check if the prompt has reappeared near the end.
-            // Claude Code's status bar occupies the last few lines, so check
-            // the last 5 lines for the ❯ prompt.
-            let ends_with_prompt = snapshot
-                .trim_end()
-                .lines()
-                .rev()
-                .take(5)
-                .any(Self::is_claude_prompt_line);
+            // Check if an idle prompt has reappeared near the end.
+            // Must be a BARE ❯ (empty prompt ready for input), not an echoed
+            // command line like "❯ echo hello" — otherwise we'd falsely detect
+            // completion while a command is still running.
+            let ends_with_prompt = snapshot.trim_end().lines().rev().take(5).any(|line| {
+                let t = line.trim();
+                t == "\u{276F}" || t == "\u{276F} "
+            });
 
             if has_new_content && ends_with_prompt && snapshot == last_snapshot {
                 stable_count += 1;
