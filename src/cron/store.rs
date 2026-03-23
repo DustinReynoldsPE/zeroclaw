@@ -138,6 +138,32 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     })
 }
 
+/// List all cron jobs directly from `workspace_dir` without a full Config.
+/// Returns an empty vec if the DB does not exist yet.
+pub fn list_jobs_in_workspace(workspace_dir: &std::path::Path) -> Result<Vec<CronJob>> {
+    let db_path = workspace_dir.join("cron").join("jobs.db");
+    if !db_path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("Failed to open cron DB: {}", db_path.display()))?;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+         FROM cron_jobs ORDER BY next_run ASC",
+    )?;
+    let rows = stmt.query_map([], map_cron_job_row)?;
+    let mut jobs = Vec::new();
+    for row in rows {
+        jobs.push(row?);
+    }
+    Ok(jobs)
+}
+
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -835,6 +861,8 @@ fn convert_delivery_decl(decl: &crate::config::schema::DeliveryConfigDecl) -> De
         channel: decl.channel.clone(),
         to: decl.to.clone(),
         best_effort: decl.best_effort,
+        token: None,
+        user_id: None,
     }
 }
 
@@ -1007,6 +1035,8 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 best_effort: true,
+                token: None,
+                user_id: None,
             }),
         )
         .unwrap();
@@ -1041,6 +1071,8 @@ mod tests {
                 channel: Some("discord".into()),
                 to: None,
                 best_effort: true,
+                token: None,
+                user_id: None,
             }),
             false,
             None,
@@ -1068,6 +1100,8 @@ mod tests {
                 channel: Some("discord".into()),
                 to: Some("1234567890".into()),
                 best_effort: true,
+                token: None,
+                user_id: None,
             }),
         )
         .unwrap_err();

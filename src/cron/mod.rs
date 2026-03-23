@@ -14,8 +14,9 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs, record_last_run,
-    record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
+    add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_jobs_in_workspace,
+    list_runs, record_last_run, record_run, remove_job, reschedule_after_run,
+    sync_declarative_jobs, update_job,
 };
 pub use types::{
     deserialize_maybe_stringified, CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType,
@@ -152,6 +153,22 @@ pub(crate) fn add_job(config: &Config, expression: &str, command: &str) -> Resul
     add_shell_job(config, None, schedule, command)
 }
 
+fn build_delivery(
+    announce_to: Option<String>,
+    channel: Option<String>,
+    token: Option<String>,
+    user_id: Option<String>,
+) -> Option<DeliveryConfig> {
+    announce_to.map(|to| DeliveryConfig {
+        mode: "announce".to_string(),
+        channel,
+        to: Some(to),
+        best_effort: true,
+        token,
+        user_id,
+    })
+}
+
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
     match command {
@@ -192,6 +209,10 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             agent,
             allowed_tools,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             let schedule = Schedule::Cron {
@@ -199,6 +220,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 tz,
             };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -206,7 +229,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -234,6 +257,10 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             at,
             agent,
             allowed_tools,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             let at = chrono::DateTime::parse_from_rfc3339(&at)
@@ -241,6 +268,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -248,7 +277,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -274,10 +303,16 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             every_ms,
             agent,
             allowed_tools,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             let schedule = Schedule::Every { every_ms };
             if agent {
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -285,7 +320,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     false,
                     if allowed_tools.is_empty() {
                         None
@@ -313,12 +348,18 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             delay,
             agent,
             allowed_tools,
+            announce_to,
+            channel,
+            announce_token,
+            announce_user_id,
             command,
         } => {
             if agent {
                 let duration = parse_delay(&delay)?;
                 let at = chrono::Utc::now() + duration;
                 let schedule = Schedule::At { at };
+                let delivery =
+                    build_delivery(announce_to, channel, announce_token, announce_user_id);
                 let job = add_agent_job(
                     config,
                     None,
@@ -326,7 +367,7 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                     &command,
                     SessionTarget::Isolated,
                     None,
-                    None,
+                    delivery,
                     true,
                     if allowed_tools.is_empty() {
                         None
@@ -887,6 +928,10 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -918,6 +963,10 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec![],
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "Check server health: disk space, memory, CPU load".into(),
             },
             &config,
@@ -940,6 +989,10 @@ mod tests {
                 tz: None,
                 agent: true,
                 allowed_tools: vec!["file_read".into(), "web_search".into()],
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "Check server health".into(),
             },
             &config,
@@ -1002,6 +1055,10 @@ mod tests {
                 tz: None,
                 agent: false,
                 allowed_tools: vec![],
+                announce_to: None,
+                channel: None,
+                announce_token: None,
+                announce_user_id: None,
                 command: "echo ok".into(),
             },
             &config,

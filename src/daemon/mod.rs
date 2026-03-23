@@ -265,7 +265,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                 continue;
                             };
                         let _ = crate::cron::scheduler::deliver_announcement(
-                            &dm_config, &channel, &target, &alert,
+                            &dm_config,
+                            &crate::cron::DeliveryConfig::default(),
+                            &channel,
+                            &target,
+                            &alert,
                         )
                         .await;
                     }
@@ -416,6 +420,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     if let Some((channel, target)) = &delivery {
                         if let Err(e) = crate::cron::scheduler::deliver_announcement(
                             &config,
+                            &crate::cron::DeliveryConfig::default(),
                             channel,
                             target,
                             &announcement,

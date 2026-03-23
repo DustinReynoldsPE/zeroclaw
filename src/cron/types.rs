@@ -110,6 +110,14 @@ pub struct DeliveryConfig {
     pub to: Option<String>,
     #[serde(default = "default_true")]
     pub best_effort: bool,
+    /// Optional Matrix access token to post as a different bot user.
+    /// When absent, falls back to the configured channel's own token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Matrix user_id that goes with the override token (e.g. @cron-bot:example.com).
+    /// Required when `token` is set so a fresh session is opened for that user.
+    #[serde(default)]
+    pub user_id: Option<String>,
 }
 
 impl Default for DeliveryConfig {
@@ -119,6 +127,8 @@ impl Default for DeliveryConfig {
             channel: None,
             to: None,
             best_effort: true,
+            token: None,
+            user_id: None,
         }
     }
 }

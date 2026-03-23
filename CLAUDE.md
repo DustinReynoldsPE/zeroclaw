@@ -83,6 +83,23 @@ Branch/commit/PR rules:
 - Do not hide behavior-changing side effects in refactor commits.
 - Do not include personal identity or sensitive information in test data, examples, docs, or commits.
 
+## Ticket Tracking
+
+Project tickets are managed with `tk` (local markdown-based CLI). Tickets live in `.tickets/` as markdown files with YAML frontmatter.
+
+```bash
+tk list                    # All open tickets (grouped by ready/blocked)
+tk ready                   # Unblocked tickets ready to work
+tk show <id>               # Full ticket details
+tk create "title" --type task --priority 1 --tags rust -d "description"
+tk advance <id> --force    # Move through pipeline
+tk skip <id> --to done --reason "explanation"
+tk add-note <id> "text"    # Append timestamped note
+tk edit <id> --parent <epic-id>  # Set parent epic
+```
+
+Pipeline stages: `triage → spec → design → implement → test → verify → done`
+
 ## Linked References
 
 - `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries

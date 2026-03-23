@@ -305,6 +305,18 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce agent output to a channel destination (e.g. a Matrix room ID)
+        #[arg(long)]
+        announce_to: Option<String>,
+        /// Channel to announce to (e.g. "matrix"); required with --announce-to
+        #[arg(long)]
+        channel: Option<String>,
+        /// Post as this Matrix access token instead of the configured channel bot
+        #[arg(long)]
+        announce_token: Option<String>,
+        /// Matrix user_id that owns the announce token (e.g. @cron-bot:example.com)
+        #[arg(long)]
+        announce_user_id: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -326,6 +338,18 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce agent output to a channel destination (e.g. a Matrix room ID)
+        #[arg(long)]
+        announce_to: Option<String>,
+        /// Channel to announce to (e.g. "matrix"); required with --announce-to
+        #[arg(long)]
+        channel: Option<String>,
+        /// Post as this Matrix access token instead of the configured channel bot
+        #[arg(long)]
+        announce_token: Option<String>,
+        /// Matrix user_id that owns the announce token (e.g. @cron-bot:example.com)
+        #[arg(long)]
+        announce_user_id: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -347,6 +371,18 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce agent output to a channel destination (e.g. a Matrix room ID)
+        #[arg(long)]
+        announce_to: Option<String>,
+        /// Channel to announce to (e.g. "matrix"); required with --announce-to
+        #[arg(long)]
+        channel: Option<String>,
+        /// Post as this Matrix access token instead of the configured channel bot
+        #[arg(long)]
+        announce_token: Option<String>,
+        /// Matrix user_id that owns the announce token (e.g. @cron-bot:example.com)
+        #[arg(long)]
+        announce_user_id: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -370,6 +406,18 @@ Examples:
         /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
         #[arg(long = "allowed-tool")]
         allowed_tools: Vec<String>,
+        /// Announce agent output to a channel destination (e.g. a Matrix room ID)
+        #[arg(long)]
+        announce_to: Option<String>,
+        /// Channel to announce to (e.g. "matrix"); required with --announce-to
+        #[arg(long)]
+        channel: Option<String>,
+        /// Post as this Matrix access token instead of the configured channel bot
+        #[arg(long)]
+        announce_token: Option<String>,
+        /// Matrix user_id that owns the announce token (e.g. @cron-bot:example.com)
+        #[arg(long)]
+        announce_user_id: Option<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },

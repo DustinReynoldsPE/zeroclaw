@@ -365,6 +365,12 @@ struct ChannelRuntimeContext {
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
+    /// Maps channel identifiers (e.g. Matrix room IDs) to local workspace paths.
+    channel_workspace_map: Arc<HashMap<String, PathBuf>>,
+    /// Maps channel identifiers to tmux window targets for interactive Claude Code routing.
+    channel_tmux_targets: Arc<HashMap<String, String>>,
+    /// Maps channel identifiers to provider+model overrides for per-room routing.
+    channel_provider_map: Arc<HashMap<String, crate::config::schema::ChannelProviderOverride>>,
     message_timeout_secs: u64,
     interrupt_on_new_message: InterruptOnNewMessageConfig,
     multimodal: crate::config::MultimodalConfig,
@@ -423,22 +429,18 @@ impl InFlightTaskCompletion {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
+    let room = extract_room_id(&msg.reply_target);
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
-        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+        Some(tid) => format!("{}_{}_{}_{}_{}", msg.channel, room, tid, msg.sender, msg.id),
+        None => format!("{}_{}_{}_{}", msg.channel, room, msg.sender, msg.id),
     }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
+    let room = extract_room_id(&msg.reply_target);
     match &msg.thread_ts {
-        Some(tid) => format!(
-            "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
-        ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        Some(tid) => format!("{}_{}_{}_{}", msg.channel, room, tid, msg.sender),
+        None => format!("{}_{}_{}", msg.channel, room, msg.sender),
     }
 }
 
@@ -466,6 +468,16 @@ fn is_stop_command(content: &str) -> bool {
     let cmd = trimmed.split_whitespace().next().unwrap_or("");
     let base = cmd.split('@').next().unwrap_or(cmd);
     base.eq_ignore_ascii_case("/stop")
+}
+
+/// Extract the room/channel identifier from a reply_target.
+/// Matrix uses "sender||room_id" format; this returns the room_id portion.
+/// For other channels, returns the reply_target as-is.
+fn extract_room_id(reply_target: &str) -> &str {
+    reply_target
+        .split_once("||")
+        .map(|(_, room)| room)
+        .unwrap_or(reply_target)
 }
 
 /// Strip tool-call XML tags from outgoing messages.
@@ -590,8 +602,11 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Matrix:\n\
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
+             - ALWAYS put your ENTIRE response in a SINGLE message. NEVER split responses into parts, \
+               say 'Part 1 above', or reference previous messages. Write everything in one reply.\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n\
+             - Do NOT use CronCreate or scheduling tools unless the user explicitly asks for reminders or scheduled tasks.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
@@ -1436,6 +1451,1078 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+/// Known `tk` subcommands that are handled directly (zero LLM tokens).
+const TICKET_SUBCOMMANDS: &[&str] = &[
+    "list", "show", "stats", "pipeline", "query", "ready", "blocked", "advance", "add-note",
+    "closed", "create", "help", "tree", "dep", "edit",
+];
+
+fn is_restart_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "restart" || lower == "!restart" || lower == "/restart"
+}
+
+async fn handle_restart_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_restart_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    // Send confirmation before the process is killed.
+    let _ = channel
+        .send(
+            &SendMessage::new(
+                "♻️ Restarting daemon — back in a moment.",
+                &msg.reply_target,
+            )
+            .in_thread(msg.thread_ts.clone()),
+        )
+        .await;
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("zeroclaw"));
+    let config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").unwrap_or_default();
+    let workspace = ctx.workspace_dir.as_os_str().to_owned();
+
+    tokio::spawn(async move {
+        // Give the send a moment to flush before we kill ourselves.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let restart_script = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|root| root.join("services/restart.sh"))
+            .filter(|p| p.exists());
+
+        let mut cmd = if let Some(script) = restart_script {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg(script);
+            c
+        } else {
+            // Fallback: inline restart without the script
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(format!(
+                "sleep 2 && pkill -f 'zeroclaw daemon' || true && sleep 1 && exec '{}'  daemon",
+                exe.display()
+            ));
+            c
+        };
+
+        cmd.env("ZEROCLAW_BIN", &exe);
+        if config_dir.is_empty() {
+            // Derive config dir from workspace_dir (parent of workspace)
+            if let Some(parent) = std::path::Path::new(&workspace).parent() {
+                cmd.env("ZEROCLAW_CONFIG_DIR", parent);
+            }
+        } else {
+            cmd.env("ZEROCLAW_CONFIG_DIR", &config_dir);
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let _ = cmd.spawn();
+    });
+
+    true
+}
+
+fn is_cron_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "cron" || lower == "cron all" || lower == "cron --all" || lower.starts_with("cron ")
+}
+
+fn format_cron_listing(jobs: &[crate::cron::CronJob], show_all: bool, room_id: &str) -> String {
+    if jobs.is_empty() {
+        return if show_all {
+            "No cron jobs scheduled.".to_string()
+        } else {
+            format!(
+                "No cron jobs scheduled for this room (`{room_id}`).\n\nUse `cron all` to list all rooms."
+            )
+        };
+    }
+
+    let header = if show_all {
+        format!("**Cron jobs** ({} total):\n", jobs.len())
+    } else {
+        format!("**Cron jobs for this room** ({}):\n", jobs.len())
+    };
+
+    let rows: Vec<String> = jobs
+        .iter()
+        .map(|job| {
+            let name = job.name.as_deref().unwrap_or(&job.id[..8]);
+            let status = if job.enabled { "" } else { " _(disabled)_" };
+            let next = job.next_run.format("%Y-%m-%d %H:%M UTC").to_string();
+            let kind = match job.job_type {
+                crate::cron::JobType::Shell => "shell",
+                crate::cron::JobType::Agent => "agent",
+            };
+            let cmd = if job.command.len() > 70 {
+                format!("{}…", &job.command[..67])
+            } else {
+                job.command.clone()
+            };
+            let room_part = if show_all {
+                job.delivery
+                    .to
+                    .as_deref()
+                    .map(|r| format!(" → `{r}`"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let last_part = match (&job.last_status, job.last_run) {
+                (Some(s), Some(t)) => format!(
+                    "  last: `{}` at {}",
+                    s,
+                    t.format("%m-%d %H:%M")
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "**{name}**{status} — `{}` ({kind}){room_part}\n  next: {next}  cmd: `{cmd}`{last_part}",
+                job.expression
+            )
+        })
+        .collect();
+
+    format!("{}{}", header, rows.join("\n\n"))
+}
+
+/// Returns true if the last non-empty lines of a tmux pane look like an
+/// unanswered question from a Claude Code session.
+fn tmux_pane_has_pending_question(pane: &str) -> bool {
+    let last: Vec<&str> = pane
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(15)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    for line in &last {
+        let lower = line.to_lowercase();
+        if lower.contains("[y/n]")
+            || lower.contains("[yes/no]")
+            || lower.contains("[y/n/s]")
+            || lower.contains("(y/n)")
+        {
+            return true;
+        }
+        if (lower.contains("do you want")
+            || lower.contains("would you like")
+            || lower.contains("should i ")
+            || lower.contains("shall i "))
+            && lower.contains('?')
+        {
+            return true;
+        }
+        // Claude Code tool approval lines
+        if lower.contains("allow") && lower.ends_with('?') {
+            return true;
+        }
+    }
+    false
+}
+
+async fn check_tmux_pending_questions(
+    tmux_targets: Arc<HashMap<String, String>>,
+    channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
+) {
+    let Some(matrix_channel) = channels_by_name.get("matrix").cloned() else {
+        return;
+    };
+
+    for (room_id, tmux_target) in tmux_targets.iter() {
+        let state = classify_tmux_target(tmux_target).await;
+        if state == "question" {
+            let reply_target = format!("cron-watch||{room_id}");
+            let msg = format!(
+                "⚠️ **Pending question in tmux** (`{tmux_target}`)\n\nThe Claude Code session appears to be waiting for input. Use `peek` to see the current state or `tmux` to send a reply."
+            );
+            if let Err(e) = matrix_channel
+                .send(&SendMessage::new(msg, &reply_target))
+                .await
+            {
+                tracing::warn!("Failed to send pending-question notice to {room_id}: {e}");
+            }
+        }
+    }
+}
+
+async fn handle_cron_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_cron_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let lower = msg.content.trim().to_lowercase();
+    let rest = lower.strip_prefix("cron").unwrap_or("").trim().to_string();
+    let show_all = rest == "all" || rest == "--all";
+
+    let room_id = extract_room_id(&msg.reply_target).to_string();
+
+    let jobs = match crate::cron::list_jobs_in_workspace(&ctx.workspace_dir) {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = channel
+                .send(
+                    &SendMessage::new(format!("Failed to load cron jobs: {e}"), &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
+                )
+                .await;
+            return true;
+        }
+    };
+
+    let filtered: Vec<crate::cron::CronJob> = if show_all {
+        jobs
+    } else {
+        jobs.into_iter()
+            .filter(|j| {
+                j.delivery.to.as_deref() == Some(&room_id)
+                    || j.delivery.to.as_deref() == Some(&msg.channel)
+            })
+            .collect()
+    };
+
+    let response = format_cron_listing(&filtered, show_all, &room_id);
+
+    if let Err(e) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send cron listing: {e}");
+    }
+
+    // Side effect: check every tmux pane for pending questions.
+    tokio::spawn(check_tmux_pending_questions(
+        Arc::clone(&ctx.channel_tmux_targets),
+        Arc::clone(&ctx.channels_by_name),
+    ));
+
+    true
+}
+
+fn is_idle_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "idle" || lower == "!idle" || lower == "/idle"
+}
+
+/// Classify a tmux target by checking the running command and pane content.
+///
+/// Uses `pane_current_command` as the primary signal — if a non-shell process
+/// is running (e.g. `claude`, `node`, `python3`), the pane is active regardless
+/// of what the content looks like. Falls through to content analysis for the
+/// question/idle distinction when a shell is the current command.
+async fn classify_tmux_target(target: &str) -> &'static str {
+    // 1. Check what command is currently running in the pane.
+    let current_cmd = tokio::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-t",
+            target,
+            "-p",
+            "#{pane_current_command}",
+        ])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase());
+
+    let shell_commands = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
+
+    if let Some(ref cmd) = current_cmd {
+        let cmd = cmd.as_str();
+        if !cmd.is_empty() && !shell_commands.contains(&cmd) {
+            // A non-shell process is running (e.g. claude binary, node, cargo).
+            // Three-way classification:
+            //   1. Explicit active signals (spinner, "Esc to interrupt") → active
+            //   2. Claude Code idle prompt (❯) visible → idle
+            //   3. Neither visible → active (signals likely scrolled off-screen)
+            if let Ok(out) = tokio::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", target])
+                .output()
+                .await
+            {
+                if out.status.success() {
+                    let content = String::from_utf8_lossy(&out.stdout);
+                    let classified = classify_tmux_pane_content(&content);
+                    if classified == "active" || classified == "question" {
+                        return classified;
+                    }
+                    // classify_tmux_pane_content returned "idle" — only trust that
+                    // if the Claude Code ❯ prompt appears immediately before the ────
+                    // status-bar separator. A ❯ anywhere else in the content is likely
+                    // a shell prompt from scroll history while Claude Code is still running.
+                    if claude_code_at_idle_prompt(&content) {
+                        return "idle";
+                    }
+                    return "active";
+                }
+            }
+            // Could not capture — assume active since a process is running.
+            return "active";
+        }
+    }
+
+    // Shell is running — check pane content for question patterns or stalled prompts.
+    match tokio::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", target])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let content = String::from_utf8_lossy(&out.stdout);
+            classify_tmux_pane_content(&content)
+        }
+        Ok(_) | Err(_) => "unavailable",
+    }
+}
+
+/// Returns true only if the Claude Code `❯` input prompt is the line immediately
+/// before the `────` status-bar separator. A `❯` elsewhere in the visible content
+/// is likely a shell prompt sitting in scroll history while the process is active.
+fn claude_code_at_idle_prompt(pane: &str) -> bool {
+    let lines: Vec<&str> = pane.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('─') && t.len() > 10 {
+            // Check the line immediately before the separator.
+            if i > 0 && lines[i - 1].trim() == "❯" {
+                return true;
+            }
+            // Allow a single blank line between ❯ and the separator.
+            if i > 1 && lines[i - 1].trim().is_empty() && lines[i - 2].trim() == "❯" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Classify raw tmux pane content into one of: "active", "question", "idle".
+fn classify_tmux_pane_content(pane: &str) -> &'static str {
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    if spinner_chars.iter().any(|c| pane.contains(*c)) {
+        return "active";
+    }
+    let lower = pane.to_lowercase();
+    let active_patterns: &[&str] = &[
+        "esc to interrupt",
+        "auto-accept edits on",
+        "⎿  running", // tool actively executing (Claude Code indented result prefix)
+    ];
+    for pat in active_patterns {
+        if lower.contains(pat) {
+            return "active";
+        }
+    }
+    // Claude Code progress indicator: "… (Nm Xs" or "… (N tokens" or "… (N s"
+    // Appears as: "· Building thing… (3m 24s · ↓ 10.9k tokens · thinking with medium effort)"
+    // The "… (" pattern with time/token context is a reliable in-progress signal.
+    if lower.contains("… (")
+        && (lower.contains("token")
+            || lower.contains("thinking")
+            || lower.contains("thought for")
+            || lower.contains(" s ·")
+            || lower.contains(" s)"))
+    {
+        return "active";
+    }
+    // Bullet + verb on its own line (Claude Code tool execution).
+    // Claude Code uses multiple bullet characters: ● (U+25CF), ⏺ (U+23FA), · (U+00B7)
+    for line in pane.lines() {
+        let t = line.trim();
+        let tl = t.to_lowercase();
+        let is_bullet = t.starts_with('●')
+            || t.starts_with('⏺')
+            || t.starts_with('·')
+            || t.starts_with('✽')
+            || t.starts_with('✻');
+        if is_bullet
+            && (tl.contains("running")
+                || tl.contains("thinking")
+                || tl.contains("reading")
+                || tl.contains("writing")
+                || tl.contains("searching")
+                || tl.contains("fetching")
+                || tl.contains("executing")
+                || tl.contains("building")
+                || tl.contains("cooking")
+                || tl.contains("working")
+                || tl.contains("generating"))
+        {
+            return "active";
+        }
+        // Trailing ellipsis on a bullet line = still in progress
+        if is_bullet && t.ends_with('…') {
+            return "active";
+        }
+    }
+    let question_patterns: &[&str] = &["[y/n]", "[yes/no]", "[y/n/s]", "(y/n)"];
+    for pat in question_patterns {
+        if lower.contains(pat) {
+            return "question";
+        }
+    }
+    // Natural-language question patterns (explicit phrases)
+    let nl_question: &[&str] = &[
+        "do you want",
+        "would you like",
+        "should i ",
+        "shall i ",
+        "want me to",
+        "should we",
+        "ready to continue",
+        "shall we",
+    ];
+    for pat in nl_question {
+        if lower.contains(pat) && lower.contains('?') {
+            return "question";
+        }
+    }
+    // Broad heuristic: any line ending with '?' that looks like natural language
+    // (not a URL, not a code comment, at least a few words). Catches Claude Code
+    // questions like "want me to continue?" regardless of exact phrasing.
+    for line in pane.lines() {
+        let t = line.trim();
+        if t.ends_with('?')
+            && t.len() > 12
+            && !t.contains("://")
+            && !t.starts_with("//")
+            && !t.starts_with('#')
+        {
+            // Must contain at least one space (multi-word sentence, not a bare symbol)
+            if t.contains(' ') {
+                return "question";
+            }
+        }
+    }
+    "idle"
+}
+
+async fn handle_idle_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_idle_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let targets = &ctx.channel_tmux_targets;
+
+    if targets.is_empty() {
+        let _ = channel
+            .send(
+                &SendMessage::new("No tmux targets configured.", &msg.reply_target)
+                    .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+        return true;
+    }
+
+    // Capture all panes concurrently.
+    let mut futs = Vec::new();
+    for (room_id, target) in targets.iter() {
+        futs.push((room_id.clone(), target.clone()));
+    }
+    let mut captures: Vec<(String, String, &'static str)> = Vec::new();
+    for (room_id, target) in futs {
+        let state = classify_tmux_target(&target).await;
+        captures.push((room_id, target, state));
+    }
+
+    // Sort: questions first, then active, then idle, then unavailable.
+    // Secondary sort by target name for consistent ordering.
+    captures.sort_by(|(_, a_target, a_state), (_, b_target, b_state)| {
+        let state_rank = |s: &str| match s {
+            "question" => 0,
+            "active" => 1,
+            "idle" => 2,
+            _ => 3,
+        };
+        state_rank(a_state)
+            .cmp(&state_rank(b_state))
+            .then_with(|| a_target.cmp(b_target))
+    });
+
+    let mut lines = vec!["**Tmux Status** — all rooms\n".to_string()];
+    for (room_id, target, state) in &captures {
+        let icon = match *state {
+            "active" => "⚙️",
+            "question" => "⚠️",
+            "idle" => "💤",
+            _ => "❓",
+        };
+        // Shorten room id for display: keep the localpart only.
+        let room_short = room_id
+            .trim_start_matches('!')
+            .split(':')
+            .next()
+            .unwrap_or(room_id);
+        lines.push(format!("{icon} `{target}` ({room_short}): **{state}**"));
+    }
+
+    let response = lines.join("\n");
+    if let Err(e) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send idle status: {e}");
+    }
+
+    true
+}
+
+fn is_peek_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "peek" || lower.starts_with("peek ") || lower == "!peek" || lower.starts_with("!peek ")
+}
+
+async fn handle_peek_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_peek_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let room_id = extract_room_id(&msg.reply_target);
+    let tmux_target = ctx
+        .channel_tmux_targets
+        .get(room_id)
+        .or_else(|| ctx.channel_tmux_targets.get(&msg.channel))
+        .cloned();
+
+    let response = match tmux_target {
+        None => "No tmux target configured for this room.".to_string(),
+        Some(target) => {
+            // Parse optional line count: "peek 30" → last 30 lines (default 50)
+            let lines: usize = msg
+                .content
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(50)
+                .min(200);
+
+            match tokio::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", &target])
+                .output()
+                .await
+            {
+                Ok(out) if out.status.success() => {
+                    let raw = String::from_utf8_lossy(&out.stdout);
+                    let visible: Vec<&str> = raw
+                        .lines()
+                        .rev()
+                        .take(lines)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    if visible.iter().all(|l| l.trim().is_empty()) {
+                        format!("`{target}` — pane is empty.")
+                    } else {
+                        format!("`{target}`\n```\n{}\n```", visible.join("\n"))
+                    }
+                }
+                Ok(_) => format!("Pane `{target}` not found."),
+                Err(e) => format!("tmux error: {e}"),
+            }
+        }
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send peek response: {err}");
+    }
+
+    true
+}
+
+fn is_ticket_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "ticket"
+        || lower == "tickets"
+        || lower.starts_with("ticket ")
+        || lower.starts_with("tickets ")
+}
+
+/// Parse a ticket message into tk CLI arguments.
+/// Returns the args to pass to `tk`, or None for help.
+fn parse_ticket_args(content: &str) -> TicketAction {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+    let rest = if lower.starts_with("tickets ") {
+        trimmed["tickets ".len()..].trim()
+    } else if lower.starts_with("ticket ") {
+        trimmed["ticket ".len()..].trim()
+    } else {
+        return TicketAction::Help;
+    };
+
+    if rest.is_empty() {
+        return TicketAction::Help;
+    }
+
+    let first_word = rest.split_whitespace().next().unwrap_or("").to_lowercase();
+
+    if first_word == "help" {
+        return TicketAction::Help;
+    }
+
+    if first_word == "create" {
+        // Explicit create — parse title + optional description from the rest.
+        let body = rest[first_word.len()..].trim();
+        let (title, description) = parse_ticket_title_desc(body);
+        let mut args = vec!["create".to_string(), title];
+        if let Some(desc) = description {
+            args.push("-d".to_string());
+            args.push(desc);
+        }
+        TicketAction::Command(args)
+    } else if TICKET_SUBCOMMANDS.contains(&first_word.as_str()) {
+        // Known subcommand — pass remaining words as args to `tk <subcommand> ...`
+        let args_str = rest[first_word.len()..].trim();
+        let mut args = vec![first_word];
+        if !args_str.is_empty() {
+            args.extend(args_str.split_whitespace().map(String::from));
+        }
+        TicketAction::Command(args)
+    } else {
+        // No known subcommand — treat as implicit `create <text>`
+        let (title, description) = parse_ticket_title_desc(rest);
+        let mut args = vec!["create".to_string(), title];
+        if let Some(desc) = description {
+            args.push("-d".to_string());
+            args.push(desc);
+        }
+        TicketAction::Command(args)
+    }
+}
+
+enum TicketAction {
+    Help,
+    Command(Vec<String>),
+}
+
+fn build_ticket_help() -> String {
+    [
+        "**Ticket Commands**",
+        "",
+        "**ticket list** `[--type X] [--tag X]` \u{2014} List open tickets",
+        "**ticket tree** \u{2014} Show tickets as parent/child tree",
+        "**ticket show** `<id>` \u{2014} Show ticket details",
+        "**ticket create** `<title> [--parent <id>]` \u{2014} Create a new ticket",
+        "**ticket edit** `<id> [--parent <id>] [--title X]` \u{2014} Edit ticket fields",
+        "**ticket stats** \u{2014} Project health overview",
+        "**ticket pipeline** `[--stage X]` \u{2014} Tickets by pipeline stage",
+        "**ticket query** `[filter]` \u{2014} Query with jq filter",
+        "**ticket ready** \u{2014} Unblocked tickets",
+        "**ticket blocked** \u{2014} Blocked tickets",
+        "**ticket advance** `<id>` \u{2014} Advance to next stage",
+        "**ticket add-note** `<id> <text>` \u{2014} Append note to ticket",
+        "**ticket dep tree** `<id>` \u{2014} Show dependency tree for a ticket",
+        "**ticket closed** `[--limit N]` \u{2014} Recently closed tickets",
+        "**ticket help** \u{2014} Show this help",
+        "",
+        "`ticket <text>` is shorthand for **ticket create**",
+    ]
+    .join("\n")
+}
+
+/// Format JSONL ticket output into readable markdown.
+fn format_ticket_list(jsonl: &str) -> String {
+    let mut by_stage: std::collections::BTreeMap<String, Vec<(String, String, u64, String)>> =
+        std::collections::BTreeMap::new();
+
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let stage = v["stage"].as_str().unwrap_or("unknown").to_string();
+            let id = v["id"].as_str().unwrap_or("?").to_string();
+            let title = v["title"].as_str().unwrap_or("Untitled").to_string();
+            let priority = v["priority"].as_u64().unwrap_or(2);
+            let ticket_type = v["type"].as_str().unwrap_or("task").to_string();
+            by_stage
+                .entry(stage)
+                .or_default()
+                .push((id, title, priority, ticket_type));
+        }
+    }
+
+    if by_stage.is_empty() {
+        return "No tickets found.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (stage, tickets) in &by_stage {
+        lines.push(format!("**{}** ({})", stage, tickets.len()));
+        for (id, title, priority, ticket_type) in tickets {
+            let type_badge = match ticket_type.as_str() {
+                "bug" => "\u{1F41B}",
+                "feature" => "\u{2728}",
+                "epic" => "\u{1F3AF}",
+                "chore" => "\u{1F9F9}",
+                _ => "\u{1F4CB}",
+            };
+            lines.push(format!(
+                "  {type_badge} **{title}**\n    `{id}` \u{2022} P{priority} \u{2022} {ticket_type}"
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// Format the output of `tk create` into a clean response.
+fn format_ticket_created(stdout: &str) -> String {
+    if let Some(id_line) = stdout.lines().find(|l| l.trim_start().starts_with("id:")) {
+        let id = id_line.trim_start_matches("id:").trim();
+        format!("Ticket filed: `{id}`")
+    } else {
+        "Ticket filed.".to_string()
+    }
+}
+
+/// Format `tk show` output: YAML frontmatter → clean header, body as-is.
+fn format_ticket_show(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+
+    // Parse frontmatter between --- delimiters
+    if !trimmed.starts_with("---") {
+        return stdout.to_string();
+    }
+
+    let after_first = &trimmed[3..];
+    let Some(end_idx) = after_first.find("\n---") else {
+        return stdout.to_string();
+    };
+
+    let frontmatter = &after_first[..end_idx];
+    let body = after_first[end_idx + 4..].trim();
+
+    // Extract fields from frontmatter
+    let mut id = "";
+    let mut stage = "";
+    let mut priority = "";
+    let mut ticket_type = "";
+    let mut assignee = "";
+    let mut tags = String::new();
+
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("id:") {
+            id = v.trim();
+        } else if let Some(v) = line.strip_prefix("stage:") {
+            stage = v.trim();
+        } else if let Some(v) = line.strip_prefix("priority:") {
+            priority = v.trim();
+        } else if let Some(v) = line.strip_prefix("type:") {
+            ticket_type = v.trim();
+        } else if let Some(v) = line.strip_prefix("assignee:") {
+            assignee = v.trim();
+        } else if let Some(v) = line.strip_prefix("tags:") {
+            tags = v
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+        }
+    }
+
+    let type_badge = match ticket_type {
+        "bug" => "\u{1F41B}",
+        "feature" => "\u{2728}",
+        "epic" => "\u{1F3AF}",
+        "chore" => "\u{1F9F9}",
+        _ => "\u{1F4CB}",
+    };
+
+    // Build title from body (first # heading or first line)
+    let title = body
+        .lines()
+        .find(|l| l.starts_with("# "))
+        .map(|l| l.trim_start_matches("# ").trim())
+        .unwrap_or("Untitled");
+
+    let description = body
+        .lines()
+        .skip_while(|l| l.starts_with("# ") || l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    let mut out = format!("{type_badge} **{title}**\n`{id}` \u{2022} **{stage}** \u{2022} P{priority} \u{2022} {ticket_type}");
+    if !assignee.is_empty() {
+        use std::fmt::Write;
+        let _ = write!(out, " \u{2022} {assignee}");
+    }
+    if !tags.is_empty() {
+        use std::fmt::Write;
+        let _ = write!(out, "\nTags: {tags}");
+    }
+    if !description.is_empty() {
+        use std::fmt::Write;
+        let _ = write!(out, "\n\n{description}");
+    }
+    out
+}
+
+/// Format `tk stats` output with bold section headers.
+fn format_ticket_stats(stdout: &str) -> String {
+    let mut lines = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            lines.push(String::new());
+        } else if trimmed.ends_with(':')
+            && trimmed
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_uppercase())
+        {
+            // Section headers like "Stage:", "Types:", "Priority:", "Open Tickets:"
+            lines.push(format!("**{}**", trimmed));
+        } else if trimmed == "PROJECT HEALTH" {
+            lines.push(format!("**{}**", trimmed));
+        } else if trimmed.contains(char::is_whitespace) {
+            // Key-value lines: bold the key
+            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+            if parts.len() == 2 {
+                lines.push(format!("  **{}** {}", parts[0], parts[1].trim()));
+            } else {
+                lines.push(format!("  {trimmed}"));
+            }
+        } else {
+            lines.push(format!("  {trimmed}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Parse a ticket create body into `(title, Option<description>)`.
+///
+/// Splits on the first sentence-ending punctuation or newline: everything
+/// before becomes the title, everything after becomes the description.
+fn parse_ticket_title_desc(rest: &str) -> (String, Option<String>) {
+    if rest.is_empty() {
+        return ("Untitled ticket".to_string(), None);
+    }
+
+    let split_at = rest
+        .char_indices()
+        .find(|(_, c)| ['.', '!', '?', '\n'].contains(c))
+        .map(|(i, c)| i + c.len_utf8());
+
+    if let Some(idx) = split_at {
+        let title = rest[..idx]
+            .trim_end_matches(['.', '!', '?', '\n'])
+            .trim()
+            .to_string();
+        let desc = rest[idx..].trim();
+        if desc.is_empty() {
+            (title, None)
+        } else {
+            (title, Some(desc.to_string()))
+        }
+    } else {
+        (rest.to_string(), None)
+    }
+}
+
+/// Legacy parse function — retained for existing tests.
+fn parse_ticket_content(content: &str) -> (String, Option<String>) {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+    let rest = if lower.starts_with("tickets ") {
+        trimmed["tickets ".len()..].trim()
+    } else if lower.starts_with("ticket ") {
+        trimmed["ticket ".len()..].trim()
+    } else {
+        return ("Untitled ticket".to_string(), None);
+    };
+
+    // Strip explicit "create" prefix: "ticket create fix the bug" → "fix the bug"
+    let rest = if rest.to_lowercase().starts_with("create ") {
+        rest["create ".len()..].trim()
+    } else if rest.eq_ignore_ascii_case("create") {
+        return ("Untitled ticket".to_string(), None);
+    } else {
+        rest
+    };
+
+    if rest.is_empty() {
+        return ("Untitled ticket".to_string(), None);
+    }
+
+    // Split on the first sentence boundary or newline.
+    let split_at = rest
+        .char_indices()
+        .find(|(_, c)| ['.', '!', '?', '\n'].contains(c))
+        .map(|(i, c)| i + c.len_utf8());
+
+    if let Some(idx) = split_at {
+        let title = rest[..idx]
+            .trim_end_matches(['.', '!', '?', '\n'])
+            .trim()
+            .to_string();
+        let desc = rest[idx..].trim();
+        if desc.is_empty() {
+            (title, None)
+        } else {
+            (title, Some(desc.to_string()))
+        }
+    } else {
+        (rest.to_string(), None)
+    }
+}
+
+async fn handle_ticket_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_ticket_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let room_id = extract_room_id(&msg.reply_target);
+    let workspace_dir = ctx
+        .channel_workspace_map
+        .get(room_id)
+        .or_else(|| ctx.channel_workspace_map.get(&msg.channel))
+        .map(|p| p.as_path())
+        .unwrap_or_else(|| ctx.workspace_dir.as_path());
+
+    let action = parse_ticket_args(&msg.content);
+
+    let response = match action {
+        TicketAction::Help => build_ticket_help(),
+        TicketAction::Command(ref args) => {
+            let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
+
+            // For `list`, use `tk query` with filters for structured JSONL output.
+            // All other subcommands run `tk <subcommand>` directly.
+            let (tk_args, format_mode) = if subcommand == "list" {
+                let mut conditions = vec![".stage != \"done\"".to_string()];
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--type" | "-t" if i + 1 < args.len() => {
+                            conditions.push(format!(".type == \"{}\"", args[i + 1]));
+                            i += 2;
+                        }
+                        "--tag" | "-T" if i + 1 < args.len() => {
+                            conditions
+                                .push(format!("(.tags // [] | any(. == \"{}\"))", args[i + 1]));
+                            i += 2;
+                        }
+                        "--priority" | "-P" if i + 1 < args.len() => {
+                            conditions.push(format!(".priority == {}", args[i + 1]));
+                            i += 2;
+                        }
+                        "--assignee" | "-a" if i + 1 < args.len() => {
+                            conditions.push(format!(".assignee == \"{}\"", args[i + 1]));
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                (vec!["query".to_string(), conditions.join(" and ")], "list")
+            } else {
+                (args.clone(), subcommand)
+            };
+
+            let mut cmd = tokio::process::Command::new("tk");
+            cmd.args(&tk_args).current_dir(workspace_dir);
+
+            match cmd.output().await {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.trim().is_empty() {
+                        match format_mode {
+                            "list" => "No tickets found.".to_string(),
+                            "ready" => "No unblocked tickets.".to_string(),
+                            "blocked" => "No blocked tickets.".to_string(),
+                            "closed" => "No recently closed tickets.".to_string(),
+                            _ => "Done.".to_string(),
+                        }
+                    } else {
+                        match format_mode {
+                            "list" => format_ticket_list(&stdout),
+                            "create" => format_ticket_created(&stdout),
+                            "show" => format_ticket_show(&stdout),
+                            "stats" => format_ticket_stats(&stdout),
+                            _ => stdout.to_string(),
+                        }
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("tk {subcommand} failed: {stderr}");
+                    format!("Failed: {}", stderr.trim())
+                }
+                Err(err) => {
+                    tracing::warn!("tk command unavailable: {err}");
+                    "Ticket command unavailable (`tk` not in PATH).".to_string()
+                }
+            }
+        }
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send ticket command response: {err}");
+    }
+
+    true
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -2115,13 +3202,80 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if handle_ticket_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_restart_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_cron_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_idle_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_peek_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
-    // ── Query classification: override route when a rule matches ──
-    if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+    // ── Per-channel provider override: route specific rooms to different providers ──
+    let room_id = extract_room_id(&msg.reply_target);
+    if let Some(override_cfg) = ctx
+        .channel_provider_map
+        .get(room_id)
+        .or_else(|| ctx.channel_provider_map.get(&msg.channel))
     {
+        tracing::info!(
+            provider = override_cfg.provider.as_str(),
+            model = override_cfg.model.as_str(),
+            channel = %msg.channel,
+            "Channel provider override applied"
+        );
+        route = ChannelRouteSelection {
+            provider: override_cfg.provider.clone(),
+            model: override_cfg.model.clone(),
+            api_key: None,
+        };
+    }
+
+    // ── Query classification: override route when a rule matches ──
+    // Skip classification for tmux-routed messages — destination is predetermined.
+    let is_tmux_prefixed = {
+        let lower = msg.content.to_lowercase();
+        lower.starts_with(">> ") || lower.starts_with("tmux ")
+    };
+    let has_tmux_target = is_tmux_prefixed
+        && (ctx.channel_tmux_targets.contains_key(room_id)
+            || ctx.channel_tmux_targets.contains_key(&msg.channel));
+    let classification_hint = if has_tmux_target {
+        None
+    } else if let (Some(cls_provider), Some(cls_model)) = (
+        ctx.query_classification.classifier_provider.as_ref(),
+        ctx.query_classification.classifier_model.as_ref(),
+    ) {
+        // Model-based classification: use a lightweight model to classify the message.
+        let available_hints: Vec<String> =
+            ctx.model_routes.iter().map(|r| r.hint.clone()).collect();
+        if let Ok(provider) = get_or_create_provider(ctx.as_ref(), cls_provider, None).await {
+            crate::agent::classifier::classify_with_model(
+                &ctx.query_classification,
+                &msg.content,
+                provider,
+                cls_model,
+                &available_hints,
+            )
+            .await
+        } else {
+            crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+        }
+    } else {
+        crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
+    };
+
+    if let Some(hint) = classification_hint {
         if let Some(matched_route) = ctx
             .model_routes
             .iter()
@@ -2195,7 +3349,7 @@ async fn process_channel_message(
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
-    let had_prior_history = if force_fresh_session {
+    let _had_prior_history = if force_fresh_session {
         false
     } else {
         ctx.conversation_histories
@@ -2301,33 +3455,137 @@ async fn process_channel_message(
         "⏱ Memory recall completed"
     );
 
-    // Merge sender + group memories, avoiding duplicates
-    let memory_context = if group_memory.is_empty() {
-        sender_memory
-    } else if sender_memory.is_empty() {
-        group_memory
+    let system_prompt =
+        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+
+    // Resolve per-channel workspace: check room ID then channel name.
+    let room_id_for_ws = extract_room_id(&msg.reply_target);
+    let workspace_prefix = ctx
+        .channel_workspace_map
+        .get(room_id_for_ws)
+        .or_else(|| ctx.channel_workspace_map.get(&msg.channel))
+        .map(|dir| format!("[ZEROCLAW_CWD:{}]\n", dir.display()));
+
+    // Inject session key so the claude-code provider can persist/resume sessions per room.
+    let session_key_prefix = format!("[ZEROCLAW_SESSION_KEY:{}]\n", room_id_for_ws);
+
+    // Resolve tmux target for this channel (if configured).
+    // Activate tmux routing when the message starts with a recognized prefix.
+    let tmux_prefixes: &[&str] = &[">> ", "tmux "];
+    let content_lower = msg.content.to_lowercase();
+    let tmux_prefix_len = tmux_prefixes
+        .iter()
+        .find(|&&p| content_lower.starts_with(p))
+        .map(|p| p.len());
+    let tmux_target = if tmux_prefix_len.is_some() {
+        ctx.channel_tmux_targets
+            .get(room_id_for_ws)
+            .or_else(|| ctx.channel_tmux_targets.get(&msg.channel))
+            .cloned()
     } else {
-        format!("{sender_memory}\n{group_memory}")
+        None
+    };
+    let is_tmux_routed = tmux_target.is_some();
+    let user_content = if let (true, Some(len)) = (is_tmux_routed, tmux_prefix_len) {
+        msg.content[len..].to_string()
+    } else {
+        msg.content.clone()
     };
 
-    // Use refreshed system prompt for new sessions (master's /new support),
-    // and inject memory into system prompt (not user message) so it
-    // doesn't pollute session history and is re-fetched each turn.
-    let base_system_prompt = if had_prior_history {
-        ctx.system_prompt.as_str().to_string()
-    } else {
-        refreshed_new_session_system_prompt(ctx.as_ref())
+    let system_prompt = {
+        let mut s = String::new();
+        if let Some(prefix) = workspace_prefix {
+            s.push_str(&prefix);
+        }
+        s.push_str(&session_key_prefix);
+        if let Some(ref target) = tmux_target {
+            use std::fmt::Write;
+            let _ = writeln!(s, "[ZEROCLAW_TMUX_TARGET:{}]", target);
+        }
+        s.push_str(&system_prompt);
+        s
     };
-    let mut system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
-    if !memory_context.is_empty() {
-        let _ = write!(system_prompt, "\n\n{memory_context}");
-    }
+
+    // Tmux-routed rooms: skip history — the interactive Claude session has its own context.
+    // Still include the current user message so the provider can forward it.
     let mut history = vec![ChatMessage::system(system_prompt)];
-    history.extend(prior_turns);
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+    if is_tmux_routed {
+        history.push(ChatMessage::user(&user_content));
+    } else {
+        history.extend(prior_turns);
+    }
+
+    // Spawn live tmux pane streaming: sends filtered response text as new Matrix messages
+    // while the provider polls the pane internally.
+    let tmux_live_cancel = CancellationToken::new();
+    let tmux_live_task = if is_tmux_routed {
+        if let (Some(ref tmux_tgt), Some(channel_ref)) = (&tmux_target, target_channel.as_ref()) {
+            let target = tmux_tgt.clone();
+            let channel = Arc::clone(channel_ref);
+            let reply_target = msg.reply_target.clone();
+            let thread_ts = msg.thread_ts.clone();
+            let sent_message = user_content.clone();
+            let cancel = tmux_live_cancel.clone();
+            // Capture baseline before the provider sends the prompt — the provider
+            // will take its own baseline, but we need ours before spawning.
+            let baseline = crate::providers::claude_code::tmux_capture_pane(&target)
+                .await
+                .unwrap_or_default();
+            Some(tokio::spawn(async move {
+                let mut last_sent_text = String::new();
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    let snapshot =
+                        match crate::providers::claude_code::tmux_capture_pane(&target).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!("tmux live poll failed: {e}");
+                                continue;
+                            }
+                        };
+                    let filtered = crate::providers::claude_code::filter_tmux_pane_text(
+                        &baseline,
+                        &snapshot,
+                        &sent_message,
+                    );
+                    if filtered.is_empty() || filtered == last_sent_text {
+                        continue;
+                    }
+                    // Find new text beyond what we already sent
+                    let new_text = if filtered.starts_with(&last_sent_text) {
+                        filtered[last_sent_text.len()..].trim().to_string()
+                    } else {
+                        // Content was restructured (e.g. earlier lines scrolled off) — send all
+                        filtered.clone()
+                    };
+                    if new_text.is_empty() {
+                        continue;
+                    }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(&new_text, &reply_target)
+                                .in_thread(thread_ts.clone()),
+                        )
+                        .await;
+                    last_sent_text = filtered;
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Disable draft streaming for tmux-routed messages — the live polling task
+    // sends new messages directly instead of editing a draft in-place.
+    let use_streaming = !is_tmux_routed
+        && target_channel
+            .as_ref()
+            .is_some_and(|ch| ch.supports_draft_updates());
 
     tracing::debug!(
         channel = %msg.channel,
@@ -2352,9 +3610,12 @@ async fn process_channel_message(
                 )
                 .await
             {
-                Ok(id) => id,
+                Ok(id) => {
+                    tracing::info!("Draft sent on {}, id={:?}", channel.name(), id);
+                    id
+                }
                 Err(e) => {
-                    tracing::debug!("Failed to send draft on {}: {e}", channel.name());
+                    tracing::warn!("Failed to send draft on {}: {e}", channel.name());
                     None
                 }
             }
@@ -2373,14 +3634,17 @@ async fn process_channel_message(
         let channel = Arc::clone(channel_ref);
         let reply_target = msg.reply_target.clone();
         let draft_id = draft_id_ref.to_string();
+        tracing::info!("Spawning draft updater for draft_id={}", draft_id);
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
+            let mut update_count = 0u32;
             while let Some(delta) = rx.recv().await {
                 if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
                     accumulated.clear();
                     continue;
                 }
                 accumulated.push_str(&delta);
+                update_count += 1;
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
                     .await
@@ -2388,8 +3652,10 @@ async fn process_channel_message(
                     tracing::debug!("Draft update failed: {e}");
                 }
             }
+            tracing::info!("Draft updater finished, {update_count} deltas received");
         }))
     } else {
+        tracing::info!("Draft updater NOT spawned: draft_id={:?}", draft_message_id);
         None
     };
 
@@ -2563,6 +3829,12 @@ async fn process_channel_message(
     }
     tracing::debug!("Post-loop: draft updater completed");
 
+    // Stop tmux live streaming now that the provider has returned.
+    tmux_live_cancel.cancel();
+    if let Some(handle) = tmux_live_task {
+        let _ = handle.await;
+    }
+
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
         msg.thread_ts = followup_thread_id(&msg);
@@ -2689,6 +3961,19 @@ async fn process_channel_message(
                 sanitized_response
             };
 
+            // Append model tag for display only — history stores the clean response.
+            let model_label = match route.model.as_str() {
+                "haiku" => "haiku",
+                "sonnet" => "sonnet",
+                "default" | "" => "opus",
+                other => other,
+            };
+            let response_for_history = delivered_response.clone();
+            let delivered_response = if is_tmux_routed {
+                delivered_response
+            } else {
+                format!("{delivered_response}\n\n`{model_label}`")
+            };
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -2709,9 +3994,9 @@ async fn process_channel_message(
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
+                response_for_history.clone()
             } else {
-                format!("{tool_summary}\n{delivered_response}")
+                format!("{tool_summary}\n{response_for_history}")
             };
 
             append_sender_turn(
@@ -2726,7 +4011,7 @@ async fn process_channel_message(
                 let model = ctx.model.to_string();
                 let memory = Arc::clone(&ctx.memory);
                 let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
+                let assistant_resp = response_for_history.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::memory::consolidation::consolidate_turn(
                         provider.as_ref(),
@@ -3897,16 +5182,20 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_full(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.allowed_rooms.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_allowed_rooms(config.channel_workspaces.keys().cloned())
+                .with_transcription(Some(config.transcription.clone()))
+                .with_tts(Some(config.tts.clone())),
+            ),
         });
     }
 
@@ -4756,6 +6045,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
+        channel_workspace_map: Arc::new(
+            config
+                .channel_workspaces
+                .iter()
+                .map(|(k, v)| (k.clone(), PathBuf::from(v)))
+                .collect(),
+        ),
+        channel_tmux_targets: Arc::new(config.tmux_targets.clone()),
+        channel_provider_map: Arc::new(config.channel_providers.clone()),
         message_timeout_secs,
         interrupt_on_new_message: InterruptOnNewMessageConfig {
             telegram: interrupt_on_new_message,
@@ -5144,6 +6442,9 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5263,6 +6564,9 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5338,6 +6642,9 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5432,6 +6739,9 @@ mod tests {
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5965,6 +7275,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6050,6 +7363,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6149,6 +7465,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6233,6 +7552,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6327,6 +7649,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6442,6 +7767,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6538,6 +7866,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6649,6 +7980,9 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6745,6 +8079,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -6834,6 +8171,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7041,6 +8381,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7148,6 +8491,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -7270,6 +8616,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7389,6 +8738,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
@@ -7490,6 +8842,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -7574,6 +8929,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8146,7 +9504,7 @@ BTC is currently around $65,000 based on latest tool output."#
             attachments: vec![],
         };
 
-        assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+        assert_eq!(conversation_memory_key(&msg), "slack_C456_U123_msg_abc123");
     }
 
     #[test]
@@ -8355,6 +9713,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8491,6 +9852,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.workspace_dir.clone()),
             prompt_config: Arc::new(config.clone()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8668,6 +10032,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8780,6 +10147,9 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9356,6 +10726,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9447,6 +10820,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9517,7 +10893,7 @@ This is an example JSON object for profile settings."#;
             sent[0]
         );
         assert!(
-            sent[1].ends_with(":ok"),
+            sent[1].contains(":ok"),
             "second reply should succeed for text-only turn, got: {}",
             sent[1]
         );
@@ -9582,6 +10958,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -9614,6 +10993,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9697,6 +11079,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -9729,6 +11114,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9804,6 +11192,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -9836,6 +11227,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9923,6 +11317,9 @@ This is an example JSON object for profile settings."#;
                     ..Default::default()
                 },
             ],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![
@@ -9963,6 +11360,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10231,6 +11631,9 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            channel_workspace_map: Arc::new(HashMap::new()),
+            channel_tmux_targets: Arc::new(HashMap::new()),
+            channel_provider_map: Arc::new(HashMap::new()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -10302,5 +11705,132 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[test]
+    fn peek_command_detection() {
+        assert!(is_peek_command("peek"));
+        assert!(is_peek_command("Peek"));
+        assert!(is_peek_command("PEEK"));
+        assert!(is_peek_command("peek 30"));
+        assert!(is_peek_command("!peek"));
+        assert!(!is_peek_command("peekaboo"));
+        assert!(!is_peek_command("take a peek"));
+        assert!(!is_peek_command(""));
+    }
+
+    #[test]
+    fn ticket_command_detection() {
+        // All "ticket ..." messages are intercepted
+        assert!(is_ticket_command("ticket fix the login bug"));
+        assert!(is_ticket_command("Ticket fix the login bug"));
+        assert!(is_ticket_command("TICKET fix the login bug"));
+        assert!(is_ticket_command("tickets need to add rate limiting"));
+        assert!(is_ticket_command("ticket create fix the login bug"));
+        assert!(is_ticket_command("ticket help"));
+        assert!(is_ticket_command("ticket list"));
+        assert!(is_ticket_command("ticket show abc123"));
+        assert!(is_ticket_command("ticket stats"));
+        assert!(is_ticket_command("ticket pipeline"));
+        assert!(is_ticket_command("ticket ready"));
+        assert!(is_ticket_command("ticket blocked"));
+        assert!(is_ticket_command("ticket closed"));
+        // Bare keyword → help
+        assert!(is_ticket_command("ticket"));
+        assert!(is_ticket_command("tickets"));
+        // Not ticket commands
+        assert!(!is_ticket_command("not a ticket command"));
+        assert!(!is_ticket_command("ticketmaster concert"));
+        assert!(!is_ticket_command("my ticket is broken"));
+    }
+
+    #[test]
+    fn ticket_args_routing() {
+        // Subcommands route to tk directly
+        assert!(
+            matches!(parse_ticket_args("ticket list"), TicketAction::Command(a) if a[0] == "list")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket show abc"), TicketAction::Command(a) if a[0] == "show" && a[1] == "abc")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket stats"), TicketAction::Command(a) if a[0] == "stats")
+        );
+        assert!(
+            matches!(parse_ticket_args("ticket create fix bug"), TicketAction::Command(a) if a[0] == "create" && a[1] == "fix bug")
+        );
+        // Implicit create
+        assert!(
+            matches!(parse_ticket_args("ticket fix the bug"), TicketAction::Command(a) if a[0] == "create")
+        );
+        // Help
+        assert!(matches!(
+            parse_ticket_args("ticket help"),
+            TicketAction::Help
+        ));
+        assert!(matches!(parse_ticket_args("ticket"), TicketAction::Help));
+    }
+
+    #[test]
+    fn ticket_content_parsing_single_sentence() {
+        let (title, desc) = parse_ticket_content("ticket fix the login bug");
+        assert_eq!(title, "fix the login bug");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_with_description() {
+        let (title, desc) =
+            parse_ticket_content("ticket fix the login bug. Users can't log in with SSO.");
+        assert_eq!(title, "fix the login bug");
+        assert_eq!(desc.as_deref(), Some("Users can't log in with SSO."));
+    }
+
+    #[test]
+    fn ticket_content_parsing_multiline() {
+        let (title, desc) = parse_ticket_content(
+            "ticket add dark mode\nIt should use prefers-color-scheme and persist the choice.",
+        );
+        assert_eq!(title, "add dark mode");
+        assert_eq!(
+            desc.as_deref(),
+            Some("It should use prefers-color-scheme and persist the choice.")
+        );
+    }
+
+    #[test]
+    fn ticket_content_parsing_empty_body() {
+        let (title, desc) = parse_ticket_content("ticket");
+        assert_eq!(title, "Untitled ticket");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_explicit_create() {
+        let (title, desc) = parse_ticket_content("ticket create fix the login bug");
+        assert_eq!(title, "fix the login bug");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_explicit_create_with_description() {
+        let (title, desc) =
+            parse_ticket_content("ticket create add rate limiting. Should apply to /webhook.");
+        assert_eq!(title, "add rate limiting");
+        assert_eq!(desc.as_deref(), Some("Should apply to /webhook."));
+    }
+
+    #[test]
+    fn ticket_content_parsing_bare_create() {
+        let (title, desc) = parse_ticket_content("ticket create");
+        assert_eq!(title, "Untitled ticket");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_tickets_prefix() {
+        let (title, desc) = parse_ticket_content("tickets rate limiting on the gateway API");
+        assert_eq!(title, "rate limiting on the gateway API");
+        assert!(desc.is_none());
     }
 }

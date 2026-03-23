@@ -889,6 +889,7 @@ mod tests {
             access_token: "tok".into(),
             user_id: None,
             device_id: None,
+            room_ids: Vec::new(),
             room_id: "!r:m".into(),
             allowed_users: vec![],
             allowed_rooms: vec![],

@@ -58,6 +58,10 @@ pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
 pub mod llm_task;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix_history;
+#[cfg(feature = "channel-matrix")]
+pub mod matrix_rooms;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -95,6 +99,7 @@ pub mod sop_list;
 pub mod sop_status;
 pub mod swarm;
 pub mod text_browser;
+pub mod ticket;
 pub mod tool_search;
 pub mod traits;
 pub mod verifiable_intent;
@@ -149,6 +154,10 @@ pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
 pub use llm_task::LlmTaskTool;
+#[cfg(feature = "channel-matrix")]
+pub use matrix_history::MatrixHistoryTool;
+#[cfg(feature = "channel-matrix")]
+pub use matrix_rooms::MatrixRoomsTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -187,6 +196,7 @@ pub use sop_list::SopListTool;
 pub use sop_status::SopStatusTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
+pub use ticket::TicketTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -697,6 +707,22 @@ pub fn all_tools_with_runtime(
             root_config.opencode_cli.clone(),
         )));
     }
+    // Matrix room history tool (feature-gated)
+    #[cfg(feature = "channel-matrix")]
+    if let Some(ref mx) = root_config.channels_config.matrix {
+        tool_arcs.push(Arc::new(MatrixHistoryTool::new(
+            mx.homeserver.clone(),
+            mx.access_token.clone(),
+            Some(mx.room_id.clone()),
+        )));
+        tool_arcs.push(Arc::new(MatrixRoomsTool::new(
+            mx.homeserver.clone(),
+            mx.access_token.clone(),
+        )));
+    }
+
+    // Ticket management tool (config-driven, shells out to `tk` CLI)
+    tool_arcs.push(Arc::new(TicketTool::new(workspace_dir.to_path_buf())));
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));

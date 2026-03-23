@@ -87,6 +87,26 @@ pub struct Config {
     /// Optional named provider profiles keyed by id (Codex app-server compatible layout).
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderConfig>,
+    /// Map channel identifiers (e.g. Matrix room IDs) to local workspace paths.
+    /// When a message arrives from a mapped channel, the provider runs in that directory.
+    /// Example: `{ "!roomABC:server" = "/Users/me/projects/alpha" }`
+    #[serde(default)]
+    pub channel_workspaces: HashMap<String, String>,
+
+    /// Map channel identifiers to tmux window targets for interactive Claude Code routing.
+    /// When a message arrives from a mapped channel using the claude-code provider,
+    /// the prompt is sent to the specified tmux pane instead of spawning a subprocess.
+    /// The tmux pane must have an interactive `claude` session running.
+    /// Example: `{ "!roomABC:server" = "main:zeroclaw" }`
+    #[serde(default)]
+    pub tmux_targets: HashMap<String, String>,
+
+    /// Map channel identifiers to provider+model overrides.
+    /// Enables per-room provider routing (e.g. one Matrix room uses local llama.cpp).
+    /// Example: `{ "!roomXYZ:server" = { provider = "custom:http://localhost:8080", model = "qwen" } }`
+    #[serde(default)]
+    pub channel_providers: HashMap<String, ChannelProviderOverride>,
+
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     #[serde(
         default = "default_temperature",
@@ -1001,6 +1021,10 @@ fn default_tts_max_text_length() -> usize {
     4096
 }
 
+fn default_tts_speed() -> f64 {
+    1.0
+}
+
 fn default_openai_tts_model() -> String {
     "tts-1".into()
 }
@@ -1051,6 +1075,9 @@ pub struct TtsConfig {
     /// Maximum input text length in characters (default 4096).
     #[serde(default = "default_tts_max_text_length")]
     pub max_text_length: usize,
+    /// Playback speed multiplier (default `1.0`, range `0.25`–`4.0`).
+    #[serde(default = "default_tts_speed")]
+    pub speed: f64,
     /// OpenAI TTS provider configuration (`[tts.openai]`).
     #[serde(default)]
     pub openai: Option<OpenAiTtsConfig>,
@@ -1076,6 +1103,7 @@ impl Default for TtsConfig {
             default_voice: default_tts_voice(),
             default_format: default_tts_format(),
             max_text_length: default_tts_max_text_length(),
+            speed: default_tts_speed(),
             openai: None,
             elevenlabs: None,
             google: None,
@@ -1088,6 +1116,11 @@ impl Default for TtsConfig {
 /// OpenAI TTS provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAiTtsConfig {
+    /// API base URL (default `"https://api.openai.com"`). Set to a local
+    /// endpoint (e.g. `"http://127.0.0.1:6009"`) for VibeVoice or other
+    /// OpenAI-compatible TTS servers.
+    #[serde(default = "default_openai_tts_base_url")]
+    pub base_url: String,
     /// API key for OpenAI TTS.
     #[serde(default)]
     pub api_key: Option<String>,
@@ -1097,6 +1130,10 @@ pub struct OpenAiTtsConfig {
     /// Playback speed multiplier (default `1.0`).
     #[serde(default = "default_openai_tts_speed")]
     pub speed: f64,
+}
+
+fn default_openai_tts_base_url() -> String {
+    "https://api.openai.com".to_string()
 }
 
 /// ElevenLabs TTS provider configuration.
@@ -4998,9 +5035,24 @@ pub struct QueryClassificationConfig {
     /// Enable automatic query classification. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Classification rules evaluated in priority order.
+    /// Classification rules evaluated in priority order (static fallback).
     #[serde(default)]
     pub rules: Vec<ClassificationRule>,
+    /// Provider for intelligent model-based classification (e.g. "ollama", "claude-code").
+    /// When set, a lightweight model call classifies messages before falling back to static rules.
+    #[serde(default)]
+    pub classifier_provider: Option<String>,
+    /// Model for intelligent classification (e.g. "qwen3:4b", "haiku").
+    #[serde(default)]
+    pub classifier_model: Option<String>,
+    /// Timeout in seconds for model-based classification. Default: 30.
+    /// Set high enough for local models that may need warm-up time.
+    #[serde(default = "default_classifier_timeout")]
+    pub classifier_timeout_secs: u64,
+}
+
+fn default_classifier_timeout() -> u64 {
+    30
 }
 
 /// A single classification rule mapping message patterns to a model hint.
@@ -5394,6 +5446,15 @@ impl<T: ChannelConfig> crate::config::traits::ConfigHandle for ConfigWrapper<T> 
 
 /// Top-level channel configurations (`[channels_config]` section).
 ///
+/// Per-channel provider+model override for channel_providers routing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChannelProviderOverride {
+    /// Provider name (e.g. "ollama", "custom:http://localhost:8080", "anthropic").
+    pub provider: String,
+    /// Model name for this provider.
+    pub model: String,
+}
+
 /// Each channel sub-section (e.g. `telegram`, `discord`) is optional;
 /// setting it to `Some(...)` enables that channel.
 #[allow(clippy::struct_excessive_bools)]
@@ -5923,6 +5984,11 @@ pub struct MatrixConfig {
     /// Optional Matrix device ID.
     #[serde(default)]
     pub device_id: Option<String>,
+    /// Additional Matrix room IDs to listen in. Combined with `room_id`.
+    /// Enables multi-room routing where each room can map to a different workspace
+    /// via `channel_workspaces`.
+    #[serde(default)]
+    pub room_ids: Vec<String>,
     /// Matrix room ID to listen in (e.g. `"!abc123:matrix.org"`).
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
@@ -7417,6 +7483,9 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: default_temperature(),
             provider_timeout_secs: default_provider_timeout_secs(),
             extra_headers: HashMap::new(),
@@ -10400,6 +10469,9 @@ default_temperature = 0.7
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: 0.5,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
@@ -10997,6 +11069,9 @@ default_temperature = 0.7
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             model_providers: HashMap::new(),
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             default_temperature: 0.9,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
@@ -11346,6 +11421,7 @@ default_temperature = 0.7
             access_token: "syt_token_abc".into(),
             user_id: Some("@bot:matrix.org".into()),
             device_id: Some("DEVICE123".into()),
+            room_ids: Vec::new(),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
@@ -11368,6 +11444,7 @@ default_temperature = 0.7
             access_token: "tok".into(),
             user_id: None,
             device_id: None,
+            room_ids: Vec::new(),
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
@@ -11462,6 +11539,7 @@ allowed_users = ["@ops:matrix.org"]
                 access_token: "tok".into(),
                 user_id: None,
                 device_id: None,
+                room_ids: Vec::new(),
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
@@ -12496,6 +12574,9 @@ requires_openai_auth = true
             default_model: Some("glm-5:cloud".to_string()),
             api_url: None,
             api_key: Some("ollama-key".to_string()),
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 
@@ -12513,6 +12594,9 @@ requires_openai_auth = true
             default_model: Some("glm-5:cloud".to_string()),
             api_url: Some("https://ollama.com/api".to_string()),
             api_key: None,
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 
@@ -12541,6 +12625,9 @@ requires_openai_auth = true
                     api_path: None,
                 },
             )]),
+            channel_workspaces: HashMap::new(),
+            tmux_targets: HashMap::new(),
+            channel_providers: HashMap::new(),
             ..Config::default()
         };
 

@@ -1,4 +1,5 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::{TranscriptionConfig, TtsConfig};
 use async_trait::async_trait;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
@@ -19,7 +20,7 @@ use matrix_sdk::{
 };
 use reqwest::Client;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -42,6 +43,15 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    transcription_config: Option<TranscriptionConfig>,
+    tts_config: Option<TtsConfig>,
+    tts_api_url: Option<String>,
+    last_draft_edit: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Tracks the current visible event ID for delete-and-resend draft updates.
+    draft_current_event: Arc<Mutex<Option<String>>>,
+    /// Additional rooms to listen on (from channel_workspaces config).
+    /// The configured `room_id` is always included implicitly.
+    allowed_rooms: HashSet<String>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -215,7 +225,98 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            transcription_config: None,
+            tts_config: None,
+            tts_api_url: None,
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
+            draft_current_event: Arc::new(Mutex::new(None)),
+            allowed_rooms: HashSet::new(),
         }
+    }
+
+    /// Add extra rooms to listen on (e.g. from channel_workspaces keys).
+    /// The configured `room_id` is always accepted regardless.
+    pub fn with_allowed_rooms(mut self, rooms: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_rooms = rooms.into_iter().collect();
+        self
+    }
+
+    pub fn with_transcription(mut self, config: Option<TranscriptionConfig>) -> Self {
+        self.transcription_config = config;
+        self
+    }
+
+    pub fn with_tts(mut self, config: Option<TtsConfig>) -> Self {
+        if let Some(ref cfg) = config {
+            if cfg.enabled {
+                self.tts_api_url = cfg
+                    .openai
+                    .as_ref()
+                    .map(|o| format!("{}/v1/audio/speech", o.base_url.trim_end_matches('/')));
+            }
+        }
+        self.tts_config = config;
+        self
+    }
+
+    /// Prepare text for TTS synthesis: strip markdown formatting, normalize
+    /// whitespace, and truncate to `max_chars` at the nearest sentence boundary.
+    fn prepare_tts_text(raw: &str, max_chars: usize) -> String {
+        let mut text = raw.to_string();
+
+        // Strip markdown block-level syntax
+        text = text
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                // Drop code fences, horizontal rules, HTML tags
+                !trimmed.starts_with("```")
+                    && !trimmed.starts_with("---")
+                    && !trimmed.starts_with('<')
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        // Strip markdown inline formatting
+        text = text
+            .replace("**", "")
+            .replace("__", "")
+            .replace(['*', '`', '~'], "")
+            .replace("[Voice message]:", "")
+            .replace("# ", "")
+            .replace("## ", "")
+            .replace("### ", "");
+
+        // Normalize dashes and whitespace
+        text = text.replace("—", ", ").replace('–', ", ");
+        text = text.replace(['\n', '\r'], " ");
+
+        // Collapse multiple spaces
+        while text.contains("  ") {
+            text = text.replace("  ", " ");
+        }
+        text = text.trim().to_string();
+
+        // Truncate at a sentence boundary using char indices (UTF-8 safe)
+        if text.chars().count() > max_chars {
+            let byte_limit = text
+                .char_indices()
+                .nth(max_chars)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len());
+
+            let truncation_point = text[..byte_limit]
+                .rfind(". ")
+                .or_else(|| text[..byte_limit].rfind("! "))
+                .or_else(|| text[..byte_limit].rfind("? "))
+                .map(|i| i + 1)
+                .unwrap_or(byte_limit);
+
+            text.truncate(truncation_point);
+            text = text.trim().to_string();
+        }
+
+        text
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -286,6 +387,676 @@ impl MatrixChannel {
 
     fn room_matches_target(target_room_id: &str, incoming_room_id: &str) -> bool {
         target_room_id == incoming_room_id
+    }
+
+    fn is_help_command(body: &str) -> bool {
+        let t = body.trim().to_lowercase();
+        t == "help"
+            || t == "!help"
+            || t == "/help"
+            || t == "commands"
+            || t == "!commands"
+            || t == "command"
+    }
+
+    fn handle_help_command() -> String {
+        [
+            "**Zero-token commands** _(no LLM, instant)_",
+            "",
+            "**usage** — Claude Code quota bars with reset dates",
+            "**restart** — restart the zeroclaw daemon (zero-token)",
+            "**idle** — tmux state for all configured rooms (idle/active/question)",
+            "**cron** — list cron jobs for this room (checks tmux for pending questions)",
+            "**cron all** — list cron jobs for all rooms",
+            "**peek** `[N]` — last N lines of this room's tmux pane (default 20)",
+            "**history** `[N]` — last N Matrix messages in this room (default 10)",
+            "**ticket** `<subcommand>` — ticket management (`ticket help` for details)",
+            "**tmux** `<text>` — send text directly to the tmux pane for this room",
+            "**help** / **commands** — this help",
+            "",
+            "Prefix any other message to route to the agent.",
+        ]
+        .join("\n")
+    }
+
+    fn is_history_command(body: &str) -> bool {
+        let t = body.trim().to_lowercase();
+        t == "history" || t == "!history" || t.starts_with("history ") || t.starts_with("!history ")
+    }
+
+    async fn fetch_room_messages(
+        http_client: &reqwest::Client,
+        homeserver: &str,
+        access_token: &str,
+        room_id: &str,
+        limit: u64,
+    ) -> String {
+        let encoded = urlencoding::encode(room_id).into_owned();
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}",
+            homeserver.trim_end_matches('/'),
+            encoded,
+            limit
+        );
+        let resp = match http_client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return format!("Failed to fetch history: {e}"),
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return format!("Failed to parse history: {e}"),
+        };
+        let chunks = match json.get("chunk").and_then(|c| c.as_array()) {
+            Some(v) => v,
+            None => return "No messages found.".to_string(),
+        };
+        let mut lines = Vec::new();
+        for ev in chunks.iter().rev() {
+            if ev.get("type").and_then(|t| t.as_str()) != Some("m.room.message") {
+                continue;
+            }
+            let sender = ev.get("sender").and_then(|s| s.as_str()).unwrap_or("?");
+            let sender_short = sender
+                .trim_start_matches('@')
+                .split(':')
+                .next()
+                .unwrap_or(sender);
+            let body = ev
+                .get("content")
+                .and_then(|c| c.get("body"))
+                .and_then(|b| b.as_str())
+                .unwrap_or("")
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(120)
+                .collect::<String>();
+            lines.push(format!("**{}**: {}", sender_short, body));
+        }
+        if lines.is_empty() {
+            "No recent messages.".to_string()
+        } else {
+            format!(
+                "**Room history** (last {}):\n\n{}",
+                lines.len(),
+                lines.join("\n")
+            )
+        }
+    }
+
+    fn is_usage_command(body: &str) -> bool {
+        let trimmed = body.trim().to_lowercase();
+        trimmed == "usage"
+            || trimmed == "!usage"
+            || trimmed == "#usage"
+            || trimmed == "/usage"
+            || trimmed.starts_with("usage ")
+            || trimmed.starts_with("!usage ")
+            || trimmed.starts_with("#usage ")
+            || trimmed.starts_with("/usage ")
+    }
+
+    async fn handle_usage_command() -> String {
+        // Fetch live quota from Anthropic's OAuth usage endpoint.
+        // Token is stored in macOS Keychain under "Claude Code-credentials".
+        if let Some(result) = Self::fetch_oauth_usage().await {
+            return result;
+        }
+        // Fallback: aggregate historical token counts from session JSONL files.
+        tokio::task::spawn_blocking(Self::aggregate_claude_code_usage)
+            .await
+            .unwrap_or_else(|_| "Usage data unavailable.".to_string())
+    }
+
+    async fn fetch_oauth_usage() -> Option<String> {
+        // Retrieve the OAuth access token from macOS Keychain.
+        let keychain_output = tokio::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
+            .output()
+            .await
+            .ok()?;
+
+        if !keychain_output.status.success() {
+            return None;
+        }
+
+        let json_str = String::from_utf8_lossy(&keychain_output.stdout);
+        let creds: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
+        let token = creds
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()?
+            .to_string();
+
+        // Call the usage endpoint.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reqwest::Client::new()
+                .get("https://api.anthropic.com/api/oauth/usage")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", "claude-code/2.0.32")
+                .send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let data: serde_json::Value = resp.json().await.ok()?;
+
+        let fmt_bar = |pct: f64| -> String {
+            let filled = ((pct / 100.0) * 20.0).round() as usize;
+            let filled = filled.min(20);
+            format!(
+                "{}{} {:.0}%",
+                "█".repeat(filled),
+                "░".repeat(20 - filled),
+                pct
+            )
+        };
+
+        let fmt_reset = |resets_at: Option<&str>| -> String {
+            resets_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| {
+                    let local = dt.with_timezone(&chrono::Local);
+                    local.format("Resets %b %-d at %-I:%M%P").to_string()
+                })
+                .unwrap_or_else(|| "No reset info".to_string())
+        };
+
+        let mut out = String::from("**Claude Code Usage**\n\n");
+
+        if let Some(fh) = data.get("five_hour") {
+            let pct = fh
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let reset = fh.get("resets_at").and_then(|v| v.as_str());
+            out.push_str(&format!(
+                "**Session (5h)**\n`{}`\n_{}_\n\n",
+                fmt_bar(pct),
+                fmt_reset(reset)
+            ));
+        }
+
+        if let Some(sd) = data.get("seven_day") {
+            let pct = sd
+                .get("utilization")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let reset = sd.get("resets_at").and_then(|v| v.as_str());
+            out.push_str(&format!(
+                "**Week (all models)**\n`{}`\n_{}_\n\n",
+                fmt_bar(pct),
+                fmt_reset(reset)
+            ));
+        }
+
+        for (key, label) in &[
+            ("seven_day_sonnet", "Week (Sonnet)"),
+            ("seven_day_opus", "Week (Opus)"),
+        ] {
+            if let Some(bucket) = data.get(key) {
+                if let Some(pct) = bucket.get("utilization").and_then(|v| v.as_f64()) {
+                    let reset = bucket.get("resets_at").and_then(|v| v.as_str());
+                    out.push_str(&format!(
+                        "**{}**\n`{}`\n_{}_\n\n",
+                        label,
+                        fmt_bar(pct),
+                        fmt_reset(reset)
+                    ));
+                }
+            }
+        }
+
+        if let Some(extra) = data.get("extra_usage") {
+            let enabled = extra
+                .get("is_enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if enabled {
+                let pct = extra
+                    .get("utilization")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                out.push_str(&format!("**Extra usage**\n`{}`\n\n", fmt_bar(pct)));
+            } else {
+                out.push_str("**Extra usage:** not enabled\n");
+            }
+        }
+
+        Some(out.trim_end().to_string())
+    }
+
+    /// Estimate cost in USD from token counts based on model name.
+    fn estimate_cost(
+        model: &str,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_creation: u64,
+    ) -> f64 {
+        // Prices per million tokens (as of mid-2025)
+        let (inp_pm, out_pm, cr_pm, cc_pm) = if model.contains("opus") {
+            (15.0, 75.0, 1.50, 18.75)
+        } else if model.contains("haiku") {
+            (0.80, 4.0, 0.08, 1.0)
+        } else {
+            // sonnet or unknown — use sonnet pricing
+            (3.0, 15.0, 0.30, 3.75)
+        };
+        (input as f64 * inp_pm
+            + output as f64 * out_pm
+            + cache_read as f64 * cr_pm
+            + cache_creation as f64 * cc_pm)
+            / 1_000_000.0
+    }
+
+    fn aggregate_claude_code_usage() -> String {
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => std::path::PathBuf::from(h),
+            Err(_) => return "Usage data unavailable: HOME not set.".to_string(),
+        };
+
+        let projects_dir = home.join(".claude").join("projects");
+        if !projects_dir.exists() {
+            return "Usage data unavailable: `~/.claude/projects` not found.".to_string();
+        }
+
+        #[derive(Default)]
+        struct Bucket {
+            input: u64,
+            output: u64,
+            cache_read: u64,
+            cache_creation: u64,
+            cost_usd: f64,
+            messages: u64,
+        }
+
+        let now_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // week = last 7 days prefix strings
+        let week_starts: Vec<String> = (0u64..7)
+            .map(|d| {
+                (chrono::Utc::now() - chrono::Duration::days(d as i64))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+
+        let mut today = Bucket::default();
+        let mut week = Bucket::default();
+        let mut all_time = Bucket::default();
+        let mut model_map: std::collections::HashMap<String, Bucket> =
+            std::collections::HashMap::new();
+
+        let project_dirs = match std::fs::read_dir(&projects_dir) {
+            Ok(d) => d,
+            Err(_) => {
+                return "Usage data unavailable: cannot read `~/.claude/projects`.".to_string()
+            }
+        };
+
+        // Deduplicate by message ID: streaming JSONL writes multiple partial records
+        // per turn. Keep only the entry with the highest output_tokens per message ID.
+        struct MsgRecord {
+            ts: String,
+            model: String,
+            inp: u64,
+            out: u64,
+            cr: u64,
+            cc: u64,
+        }
+        let mut best: std::collections::HashMap<String, MsgRecord> =
+            std::collections::HashMap::new();
+
+        for project_entry in project_dirs.flatten() {
+            let path = project_entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let files = match std::fs::read_dir(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for file_entry in files.flatten() {
+                let fpath = file_entry.path();
+                if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let contents = match std::fs::read_to_string(&fpath) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    let msg = match entry.get("message") {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let usage = match msg.get("usage") {
+                        Some(u) => u,
+                        None => continue,
+                    };
+                    let mid = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let out = usage
+                        .get("output_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+
+                    // Skip partial streaming records (no output yet)
+                    if out == 0 && mid.is_empty() {
+                        continue;
+                    }
+
+                    let existing_out = best.get(&mid).map(|r| r.out).unwrap_or(0);
+                    if out >= existing_out {
+                        best.insert(
+                            mid,
+                            MsgRecord {
+                                ts: entry
+                                    .get("timestamp")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                model: msg
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("unknown")
+                                    .to_string(),
+                                inp: usage
+                                    .get("input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                out,
+                                cr: usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                cc: usage
+                                    .get("cache_creation_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        for rec in best.values() {
+            let cost = Self::estimate_cost(&rec.model, rec.inp, rec.out, rec.cr, rec.cc);
+
+            all_time.input += rec.inp;
+            all_time.output += rec.out;
+            all_time.cache_read += rec.cr;
+            all_time.cache_creation += rec.cc;
+            all_time.cost_usd += cost;
+            all_time.messages += 1;
+
+            if rec.ts.starts_with(&now_str) {
+                today.input += rec.inp;
+                today.output += rec.out;
+                today.cache_read += rec.cr;
+                today.cache_creation += rec.cc;
+                today.cost_usd += cost;
+                today.messages += 1;
+            }
+
+            if week_starts.iter().any(|d| rec.ts.starts_with(d.as_str())) {
+                week.input += rec.inp;
+                week.output += rec.out;
+                week.cache_read += rec.cr;
+                week.cache_creation += rec.cc;
+                week.cost_usd += cost;
+                week.messages += 1;
+            }
+
+            let entry = model_map
+                .entry(rec.model.clone())
+                .or_insert_with(Bucket::default);
+            entry.input += rec.inp;
+            entry.output += rec.out;
+            entry.cache_read += rec.cr;
+            entry.cache_creation += rec.cc;
+            entry.cost_usd += cost;
+            entry.messages += 1;
+        }
+
+        if all_time.messages == 0 {
+            return "No Claude Code usage data found.".to_string();
+        }
+
+        let fmt_tok = |n: u64| -> String {
+            if n >= 1_000_000 {
+                format!("{:.2}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}k", n as f64 / 1_000.0)
+            } else {
+                n.to_string()
+            }
+        };
+
+        let fmt_cost = |c: f64| -> String { format!("${:.4}", c) };
+
+        let row = |b: &Bucket| -> String {
+            format!(
+                "in {} · out {} · cache r{}/w{} · {} · {} msgs",
+                fmt_tok(b.input),
+                fmt_tok(b.output),
+                fmt_tok(b.cache_read),
+                fmt_tok(b.cache_creation),
+                fmt_cost(b.cost_usd),
+                b.messages,
+            )
+        };
+
+        let mut out = String::from("**Claude Code Usage** _(API-rate estimates)_\n\n");
+        out.push_str(&format!("**Today:** {}\n", row(&today)));
+        out.push_str(&format!("**7 days:** {}\n", row(&week)));
+        out.push_str(&format!("**All time:** {}\n", row(&all_time)));
+
+        if !model_map.is_empty() {
+            let mut models: Vec<_> = model_map.iter().collect();
+            models.sort_by(|a, b| {
+                b.1.cost_usd
+                    .partial_cmp(&a.1.cost_usd)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            out.push_str("\n**By model:**\n");
+            for (model, b) in models.iter().take(5) {
+                out.push_str(&format!(
+                    "- `{}` — {} msgs · {}\n",
+                    model,
+                    b.messages,
+                    fmt_cost(b.cost_usd)
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// After initial sync, scan each accepted room for unanswered messages sent during downtime.
+    /// For each room, queues at most the single most-recent unanswered message. Rooms are
+    /// processed with a 500 ms inter-room delay to avoid response floods. Messages older than
+    /// 24 hours are ignored.
+    async fn check_unanswered_on_startup(
+        &self,
+        accepted_rooms: &HashSet<OwnedRoomId>,
+        my_user_id: &str,
+        dedupe: &Arc<
+            Mutex<(
+                std::collections::VecDeque<String>,
+                std::collections::HashSet<String>,
+            )>,
+        >,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) {
+        let cutoff_ms = chrono::Utc::now().timestamp_millis() - 86_400_000;
+
+        let mut rooms: Vec<&OwnedRoomId> = accepted_rooms.iter().collect();
+        rooms.sort_by_key(|r| r.as_str());
+
+        for (i, room_id) in rooms.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+
+            let encoded = Self::encode_path_segment(room_id.as_str());
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit=50",
+                self.homeserver, encoded
+            );
+
+            let resp = match self
+                .http_client
+                .get(&url)
+                .header("Authorization", self.auth_header_value())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    tracing::warn!(
+                        "Startup check: messages API returned {} for {}",
+                        r.status(),
+                        room_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup check: failed to fetch messages for {}: {}",
+                        room_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let data: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup check: failed to parse messages for {}: {}",
+                        room_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let chunk = match data.get("chunk").and_then(|c| c.as_array()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // chunk is newest-first (dir=b). Walk until we find the most recent
+            // allowed-user message. If a bot message appears first, the room is answered.
+            let mut candidate: Option<(String, String, String, i64)> = None;
+
+            for event in chunk {
+                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if event_type != "m.room.message" {
+                    continue;
+                }
+
+                let ts = event
+                    .get("origin_server_ts")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+                if ts < cutoff_ms {
+                    break;
+                }
+
+                let sender = event.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+
+                if sender == my_user_id {
+                    break; // bot already replied — room is answered
+                }
+
+                if !Self::is_sender_allowed(&self.allowed_users, sender) {
+                    continue;
+                }
+
+                let body = event
+                    .get("content")
+                    .and_then(|c| c.get("body"))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if !Self::has_non_empty_body(&body) {
+                    continue;
+                }
+
+                let event_id = event
+                    .get("event_id")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                candidate = Some((event_id, sender.to_string(), body, ts));
+                break;
+            }
+
+            if let Some((event_id, sender, body, ts)) = candidate {
+                {
+                    let mut guard = dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    if Self::cache_event_id(&event_id, recent_order, recent_lookup) {
+                        continue;
+                    }
+                }
+
+                tracing::info!(
+                    "Matrix startup: queuing unanswered message in {} from {}",
+                    room_id,
+                    sender
+                );
+
+                let msg = ChannelMessage {
+                    id: event_id,
+                    sender: sender.clone(),
+                    reply_target: format!("{}||{}", sender, room_id),
+                    content: body,
+                    channel: "matrix".to_string(),
+                    timestamp: (ts / 1000) as u64,
+                    thread_ts: None,
+                };
+
+                let _ = tx.send(msg).await;
+            }
+        }
     }
 
     fn cache_event_id(
@@ -641,48 +1412,153 @@ impl Channel for MatrixChannel {
 
         room.send(content).await?;
 
-        // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
+        // Voice reply: synthesize TTS and send as m.audio
         if self.voice_mode.load(Ordering::Relaxed) {
             self.voice_mode.store(false, Ordering::Relaxed);
             tracing::info!("Voice mode active, generating TTS reply");
-            let voice_work = std::path::PathBuf::from("/tmp/zeroclaw-voice");
-            let _ = tokio::fs::create_dir_all(&voice_work).await;
-            let mp3_path = voice_work.join("reply.mp3");
 
-            let tts_text = message
-                .content
-                .replace("**", "")
-                .replace(['*', '`'], "")
-                .replace("# ", "");
+            let max_chars = self
+                .tts_config
+                .as_ref()
+                .map(|c| c.max_text_length)
+                .unwrap_or(800);
+            let tts_text = Self::prepare_tts_text(&message.content, max_chars);
+            tracing::info!("TTS synthesizing {} chars", tts_text.len());
 
-            let tts_ok = tokio::process::Command::new("edge-tts")
-                .arg("--text")
-                .arg(&tts_text)
-                .arg("--write-media")
-                .arg(&mp3_path)
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            // Synthesize audio: try Kokoro API first, then macOS say, then edge-tts
+            let audio_result: Option<(Vec<u8>, &str, &str)> = {
+                let mut result = None;
 
-            if tts_ok && mp3_path.exists() {
-                if let Ok(audio_data) = tokio::fs::read(&mp3_path).await {
-                    let upload_url = format!(
-                        "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
-                        self.homeserver
-                    );
-                    if let Ok(resp) = self
+                // Try Kokoro/OpenAI-compatible TTS API
+                if let Some(ref tts_url) = self.tts_api_url {
+                    let voice = self
+                        .tts_config
+                        .as_ref()
+                        .map(|c| c.default_voice.as_str())
+                        .unwrap_or("echo");
+                    let speed = self.tts_config.as_ref().map(|c| c.speed).unwrap_or(1.0);
+                    let tts_body = serde_json::json!({
+                        "model": "tts-1",
+                        "input": &tts_text,
+                        "voice": voice,
+                        "response_format": "wav",
+                        "speed": speed
+                    });
+                    match self
                         .http_client
-                        .post(&upload_url)
-                        .header("Authorization", self.auth_header_value())
-                        .header("Content-Type", "audio/mpeg")
-                        .body(audio_data)
+                        .post(tts_url)
+                        .json(&tts_body)
+                        .timeout(std::time::Duration::from_secs(120))
                         .send()
                         .await
                     {
-                        if resp.status().is_success() {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            if let Ok(bytes) = resp.bytes().await {
+                                result = Some((bytes.to_vec(), "audio/wav", "voice-reply.wav"));
+                            }
+                        }
+                        Ok(resp) => {
+                            tracing::warn!("TTS API error: {}", resp.status());
+                        }
+                        Err(e) => {
+                            tracing::warn!("TTS API unavailable: {}", e);
+                        }
+                    }
+                }
+
+                // Fallback: macOS say
+                if result.is_none() {
+                    tracing::info!("Falling back to macOS say");
+                    let voice_dir = std::path::PathBuf::from("/tmp/zeroclaw-voice");
+                    let _ = tokio::fs::create_dir_all(&voice_dir).await;
+                    let aiff_path = voice_dir.join("reply.aiff");
+                    let wav_path = voice_dir.join("reply.wav");
+
+                    let say_ok = tokio::process::Command::new("say")
+                        .args(["-v", "Reed (English (US))", "-o"])
+                        .arg(&aiff_path)
+                        .arg(&tts_text)
+                        .output()
+                        .await
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+
+                    if say_ok {
+                        let convert_ok = tokio::process::Command::new("ffmpeg")
+                            .args([
+                                "-hide_banner",
+                                "-loglevel",
+                                "error",
+                                "-y",
+                                "-i",
+                                aiff_path.to_str().unwrap_or_default(),
+                                "-ar",
+                                "24000",
+                                "-ac",
+                                "1",
+                                wav_path.to_str().unwrap_or_default(),
+                            ])
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if convert_ok {
+                            result = tokio::fs::read(&wav_path)
+                                .await
+                                .ok()
+                                .map(|d| (d, "audio/wav", "voice-reply.wav"));
+                        }
+                    }
+                }
+
+                // Last resort: edge-tts (cloud)
+                if result.is_none() {
+                    tracing::info!("Falling back to edge-tts");
+                    let mp3_path = std::path::PathBuf::from("/tmp/zeroclaw-voice/reply.mp3");
+                    let edge_ok = tokio::process::Command::new("edge-tts")
+                        .args(["--text", &tts_text, "--write-media"])
+                        .arg(&mp3_path)
+                        .output()
+                        .await
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if edge_ok {
+                        result = tokio::fs::read(&mp3_path)
+                            .await
+                            .ok()
+                            .map(|d| (d, "audio/mpeg", "voice-reply.mp3"));
+                    }
+                }
+
+                result
+            };
+
+            // Upload audio to Matrix and send as voice message
+            if let Some((audio_data, mime, filename)) = audio_result {
+                let upload_url = format!(
+                    "{}/_matrix/media/v3/upload?filename={}",
+                    self.homeserver, filename
+                );
+                let audio_len = audio_data.len();
+                match self
+                    .http_client
+                    .post(&upload_url)
+                    .header("Authorization", self.auth_header_value())
+                    .header("Content-Type", mime)
+                    .body(audio_data)
+                    .send()
+                    .await
+                {
+                    Ok(upload_resp) if upload_resp.status().is_success() => {
+                        match upload_resp.json::<serde_json::Value>().await {
+                            Ok(body) => {
                                 if let Some(content_uri) = body["content_uri"].as_str() {
+                                    tracing::info!(
+                                        "Audio uploaded: {} ({} bytes) -> {}",
+                                        filename,
+                                        audio_len,
+                                        content_uri
+                                    );
                                     let encoded_room = Self::encode_path_segment(&target_room_id);
                                     let txn_id = format!(
                                         "voice_{}",
@@ -695,27 +1571,262 @@ impl Channel for MatrixChannel {
                                         "msgtype": "m.audio",
                                         "body": "Voice reply",
                                         "url": content_uri,
-                                        "info": { "mimetype": "audio/mpeg" }
+                                        "info": {
+                                            "mimetype": mime,
+                                            "duration": 0
+                                        },
+                                        "org.matrix.msc3245.voice": {}
                                     });
                                     let send_url = format!(
                                         "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
                                         self.homeserver, encoded_room, txn_id
                                     );
-                                    let _ = self
+                                    match self
                                         .http_client
                                         .put(&send_url)
                                         .header("Authorization", self.auth_header_value())
                                         .json(&audio_msg)
                                         .send()
-                                        .await;
+                                        .await
+                                    {
+                                        Ok(put_resp) => {
+                                            let status = put_resp.status();
+                                            let resp_body =
+                                                put_resp.text().await.unwrap_or_default();
+                                            if status.is_success() {
+                                                tracing::info!("Voice reply sent to Matrix");
+                                            } else {
+                                                tracing::warn!(
+                                                    "Voice PUT failed ({}): {}",
+                                                    status,
+                                                    resp_body
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!("Voice PUT request error: {}", e);
+                                        }
+                                    }
                                 }
                             }
+                            Err(e) => {
+                                tracing::warn!("Failed to parse upload response: {}", e);
+                            }
                         }
+                    }
+                    Ok(resp) => {
+                        tracing::warn!("Audio upload failed: {}", resp.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Audio upload request error: {}", e);
                     }
                 }
             }
         }
 
+        Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        true
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        let room_id = if message.recipient.contains("||") {
+            message.recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let initial_text = if message.content.is_empty() {
+            "\u{2026}" // ellipsis
+        } else {
+            &message.content
+        };
+
+        let txn_id = format!(
+            "draft_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+
+        let body = serde_json::json!({
+            "msgtype": "m.text",
+            "body": initial_text,
+        });
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        let resp = self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix send_draft failed: {err}");
+        }
+
+        let resp_json: serde_json::Value = resp.json().await?;
+        let event_id = resp_json["event_id"].as_str().map(|s| s.to_string());
+
+        if let Some(ref id) = event_id {
+            self.last_draft_edit
+                .lock()
+                .await
+                .insert(id.clone(), std::time::Instant::now());
+        }
+
+        Ok(event_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Rate-limit: at most one edit every 2 seconds
+        {
+            let edits = self.last_draft_edit.lock().await;
+            if let Some(last_time) = edits.get(message_id) {
+                if last_time.elapsed().as_millis() < 2000 {
+                    return Ok(());
+                }
+            }
+        }
+
+        let room_id = if recipient.contains("||") {
+            recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        // Use m.replace to silently edit the original draft message
+        let txn_id = format!(
+            "edit_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        let _ = self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("* {text}"),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": text,
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": message_id,
+                }
+            }))
+            .send()
+            .await;
+
+        self.last_draft_edit
+            .lock()
+            .await
+            .insert(message_id.to_string(), std::time::Instant::now());
+
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().await.remove(message_id);
+
+        let room_id = if recipient.contains("||") {
+            recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let current_id = self
+            .draft_current_event
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| message_id.to_string());
+
+        // Edit the draft message in-place via m.replace
+        let txn_id = format!(
+            "final_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+            self.homeserver, encoded_room, txn_id
+        );
+
+        match self
+            .http_client
+            .put(&url)
+            .header("Authorization", self.auth_header_value())
+            .json(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": format!("* {text}"),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": text,
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": current_id,
+                }
+            }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!("Matrix draft finalized (edit-in-place)");
+            }
+            Ok(r) => {
+                let status = r.status();
+                let err = r.text().await.unwrap_or_default();
+                tracing::warn!("Matrix finalize_draft failed ({}): {}", status, err);
+                anyhow::bail!("finalize_draft send failed: {status}");
+            }
+            Err(e) => {
+                tracing::warn!("Matrix finalize_draft request error: {}", e);
+                anyhow::bail!("finalize_draft request error: {e}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn cancel_draft(&self, _recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit.lock().await.remove(message_id);
+        *self.draft_current_event.lock().await = None;
         Ok(())
     }
 
@@ -743,9 +1854,24 @@ impl Channel for MatrixChannel {
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
+        // Build the set of rooms we accept messages from.
+        // The configured room_id always passes; additional rooms come from channel_workspaces.
+        let mut accepted_rooms: HashSet<OwnedRoomId> = HashSet::new();
+        accepted_rooms.insert(target_room.clone());
+        for room_str in &self.allowed_rooms {
+            match room_str.parse::<OwnedRoomId>() {
+                Ok(parsed) => {
+                    accepted_rooms.insert(parsed);
+                }
+                Err(e) => {
+                    tracing::warn!("Skipping unparseable workspace room '{}': {}", room_str, e);
+                }
+            }
+        }
+
         tracing::info!(
-            "Matrix channel listening on room {} (configured as {})...",
-            target_room_id,
+            "Matrix channel listening on {} room(s) (primary: {})",
+            accepted_rooms.len(),
             self.room_id
         );
 
@@ -754,41 +1880,41 @@ impl Channel for MatrixChannel {
             std::collections::HashSet::new(),
         )));
 
+        self.check_unanswered_on_startup(
+            &accepted_rooms,
+            my_user_id.as_str(),
+            &recent_event_cache,
+            &tx,
+        )
+        .await;
+
         let tx_handler = tx.clone();
-        let target_room_for_handler = target_room.clone();
+        let accepted_rooms_for_handler = Arc::new(accepted_rooms);
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
+        let http_client_for_handler = self.http_client.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
+        let transcription_config_for_handler = self.transcription_config.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let target_room = target_room_for_handler.clone();
+            let accepted_rooms = Arc::clone(&accepted_rooms_for_handler);
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
+            let http_client = http_client_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
+            let transcription_config = transcription_config_for_handler.clone();
 
             async move {
-                if !MatrixChannel::room_matches_target(
-                    target_room.as_str(),
-                    room.room_id().as_str(),
-                ) {
-                    return;
-                }
-
-                // Room allowlist: skip messages from rooms not in the configured list
-                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
-                    tracing::debug!(
-                        "Matrix: ignoring message from room {} (not in allowed_rooms)",
-                        room.room_id()
-                    );
+                if !accepted_rooms.contains(room.room_id()) {
                     return;
                 }
 
@@ -873,50 +1999,55 @@ impl Channel for MatrixChannel {
                     body
                 };
 
-                // Voice transcription: if this was an audio message, transcribe it
+                // Voice transcription: if this was an audio message, transcribe via API
                 let body = if body.starts_with("[audio:") {
-                    if let Some(path_start) = body.find("saved to ") {
-                        let audio_path = body[path_start + 9..].to_string();
-                        let wav_path = format!("{}.16k.wav", audio_path);
-                        let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args([
-                                "-y",
-                                "-i",
-                                &audio_path,
-                                "-ar",
-                                "16000",
-                                "-ac",
-                                "1",
-                                "-f",
-                                "wav",
-                                &wav_path,
-                            ])
-                            .stderr(std::process::Stdio::null())
-                            .output()
-                            .await
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if convert_ok {
-                            let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args([
-                                    "-m",
-                                    "/tmp/ggml-base.en.bin",
-                                    "-f",
-                                    &wav_path,
-                                    "--no-timestamps",
-                                    "-nt",
-                                ])
-                                .output()
+                    if let (Some(config), Some(path_start)) =
+                        (&transcription_config, body.find("saved to "))
+                    {
+                        if config.enabled {
+                            let audio_path = body[path_start + 9..].to_string();
+                            let file_name = std::path::Path::new(&audio_path)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "audio.ogg".to_string());
+                            match tokio::fs::read(&audio_path).await {
+                                Ok(audio_data) => match super::transcription::transcribe_audio(
+                                    audio_data, &file_name, config,
+                                )
                                 .await
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            if let Some(text) = transcription {
-                                voice_mode.store(true, Ordering::Relaxed);
-                                format!("[Voice message]: {}", text)
-                            } else {
-                                body
+                                {
+                                    Ok(text) if !text.trim().is_empty() => {
+                                        voice_mode.store(true, Ordering::Relaxed);
+                                        tracing::info!(
+                                            "Matrix voice transcription: {:?}",
+                                            text.trim()
+                                        );
+                                        format!("[Voice message]: {}", text.trim())
+                                    }
+                                    Ok(_) => {
+                                        tracing::warn!(
+                                            "Transcription returned empty text for {}",
+                                            file_name
+                                        );
+                                        body
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Transcription failed for {}: {}",
+                                            file_name,
+                                            e
+                                        );
+                                        body
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to read audio file {}: {}",
+                                        audio_path,
+                                        e
+                                    );
+                                    body
+                                }
                             }
                         } else {
                             body
@@ -951,6 +2082,68 @@ impl Channel for MatrixChannel {
                     .await
                 {
                     tracing::warn!("Matrix failed to send read receipt: {error}");
+                }
+
+                // Helper: send a zero-token reply and return early.
+                macro_rules! send_zero_token {
+                    ($text:expr, $label:expr) => {{
+                        let mut content = RoomMessageEventContent::text_markdown(&$text);
+                        if let Some(ref thread_ts) = match &event.content.relates_to {
+                            Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
+                            _ => None,
+                        } {
+                            if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                                content.relates_to = Some(Relation::Thread(Thread::plain(
+                                    thread_root.clone(),
+                                    thread_root,
+                                )));
+                            }
+                        }
+                        if let Err(e) = room.send(content).await {
+                            tracing::warn!("Matrix failed to send {} result: {}", $label, e);
+                        } else {
+                            tracing::info!("Matrix {} command executed", $label);
+                        }
+                        if let Err(error) = room.typing_notice(false).await {
+                            tracing::warn!("Matrix failed to stop typing notification: {error}");
+                        }
+                        return;
+                    }};
+                }
+
+                // Check for usage command (zero-token operation)
+                if MatrixChannel::is_usage_command(&body) {
+                    let result = MatrixChannel::handle_usage_command().await;
+                    send_zero_token!(result, "usage");
+                }
+
+                // Check for help/commands command (zero-token operation)
+                if MatrixChannel::is_help_command(&body) {
+                    let result = MatrixChannel::handle_help_command();
+                    send_zero_token!(result, "help");
+                }
+
+                // Check for history command (zero-token operation)
+                if MatrixChannel::is_history_command(&body) {
+                    let limit: u64 = body
+                        .trim()
+                        .to_lowercase()
+                        .trim_start_matches('!')
+                        .trim_start_matches("history")
+                        .trim()
+                        .parse()
+                        .unwrap_or(10)
+                        .min(50);
+                    let room_id_str = room.room_id().as_str();
+                    let result = MatrixChannel::fetch_room_messages(
+                        &http_client,
+                        &homeserver,
+                        &access_token,
+                        room_id_str,
+                        limit,
+                    )
+                    .await;
+                    send_zero_token!(result, "history");
                 }
 
                 // Start typing notification while processing begins
