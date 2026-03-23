@@ -128,10 +128,18 @@ else:
 
 last_human_ts="$(echo "$idle_json" | python3 -c "
 import json, sys
+from datetime import datetime, timezone, timedelta
 d = json.load(sys.stdin)
 ts = d.get('last_ts_human') or 'unknown'
-# shorten to HH:MM UTC
-print(ts[11:16] + ' UTC' if len(ts) >= 16 else ts)
+if len(ts) >= 16:
+    try:
+        utc = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+        local = utc.astimezone()
+        print(local.strftime('%I:%M %p %Z').lstrip('0'))
+    except Exception:
+        print(ts[11:16])
+else:
+    print(ts)
 " 2>/dev/null || echo "")"
 
 last_sender="$(echo "$idle_json" | python3 -c "
