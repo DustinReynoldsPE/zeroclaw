@@ -30,8 +30,6 @@ HOMESERVER="$(python3 -c "import json; print(json.load(open('$CRON_BOT_CONFIG'))
 ACCESS_TOKEN="$(python3 -c "import json; print(json.load(open('$CRON_BOT_CONFIG'))['access_token'])")"
 CRON_BOT_USER="$(python3 -c "import json; print(json.load(open('$CRON_BOT_CONFIG'))['user_id'])")"
 
-IDLE_MARKER="state:idle/idle"
-
 # ── Tmux state ──────────────────────────────────────────────────────────────
 tmux_target=""
 if [[ -f "$CONFIG_TOML" ]]; then
@@ -57,7 +55,8 @@ if [[ -n "$tmux_target" ]]; then
     # When Claude Code is active, pane_current_command will be 'claude' or 'node',
     # not a shell. This is far more reliable than content scraping.
     pane_cmd="$(tmux display-message -t "$tmux_target" -p '#{pane_current_command}' 2>/dev/null || echo "")"
-    pane="$(tmux capture-pane -p -t "$tmux_target" 2>/dev/null || echo "")"
+    pane_file="$(mktemp)"
+    tmux capture-pane -p -t "$tmux_target" > "$pane_file" 2>/dev/null || true
 
     shell_commands="bash zsh sh fish dash ksh tcsh csh"
     is_shell=false
@@ -66,55 +65,44 @@ if [[ -n "$tmux_target" ]]; then
     done
 
     if [[ -n "$pane_cmd" && "$is_shell" == "false" ]]; then
-        # Non-shell process running (e.g. claude binary at idle prompt, or actively working).
-        # Run the full content classifier — a claude session sitting at '❯' should be idle.
-        tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -30 | python3 -c "
-import sys, re
-raw = sys.stdin.read(); lower = raw.lower()
-spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-if any(c in raw for c in spinner_chars):
-    print('active'); sys.exit()
-active_patterns = [
-    r'^\s*●\s+(running|thinking|reading|writing|searching|fetching|executing)',
-    r'\besc to interrupt\b', r'auto-accept edits on',
-]
-for p in active_patterns:
-    if re.search(p, lower, re.MULTILINE):
-        print('active'); sys.exit()
-question_patterns = [
-    r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
-    r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*\$',
-]
-for p in question_patterns:
-    if re.search(p, lower):
-        print('question'); sys.exit()
-print('idle')
-" 2>/dev/null || echo "idle")"
+        tail_lines=30
     else
-        # Shell is running — fall back to content-based detection
-        tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -20 | python3 -c "
+        tail_lines=20
+    fi
+    # Classify pane content from temp file to avoid bash quoting issues
+    # with arbitrary tmux content (parentheses, quotes, etc.)
+    tmux_state="$(grep -v '^\s*$' "$pane_file" | tail -"$tail_lines" | python3 -c "
 import sys, re
 raw = sys.stdin.read(); lower = raw.lower()
 spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
 if any(c in raw for c in spinner_chars):
     print('active'); sys.exit()
 active_patterns = [
-    r'^\s*●\s+(running|thinking|reading|writing|searching|fetching|executing)',
+    r'^\s*[●⏺·✽✻]\s+(running|thinking|reading|writing|searching|fetching|executing|building|cooking|working|generating)',
+    r'[●⏺·✽✻].*\…\$',
     r'\besc to interrupt\b', r'auto-accept edits on',
+    r'⎿\s+running',
 ]
 for p in active_patterns:
     if re.search(p, lower, re.MULTILINE):
         print('active'); sys.exit()
+if re.search(r'…\s*\(', raw) and re.search(r'token|thinking|thought for|\ds\s*[·)]', lower):
+    print('active'); sys.exit()
 question_patterns = [
     r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
     r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*\$',
+    r'want me to.*\?', r'should we.*\?', r'shall (i|we).*\?', r'ready to continue.*\?',
 ]
 for p in question_patterns:
     if re.search(p, lower):
         print('question'); sys.exit()
+for line in raw.splitlines():
+    t = line.strip()
+    if t.endswith('?') and len(t) > 12 and ' ' in t and '://' not in t and not t.startswith('//') and not t.startswith('#'):
+        print('question'); sys.exit()
 print('idle')
 " 2>/dev/null || echo "idle")"
-    fi
+    rm -f "$pane_file"
     tmux_detail=" (\`${tmux_target}\`)"
 fi
 
@@ -153,12 +141,13 @@ s = d.get('last_sender') or ''
 print(s.split(':')[0].lstrip('@') if s else '')
 " 2>/dev/null || echo "")"
 
-# ── Idle/idle dedup ─────────────────────────────────────────────────────────
-# If current state is idle/idle, check if cron-bot's last message was also idle/idle.
-# If so, skip — no need to repeat the same status.
-if [[ "$tmux_state" == "idle" && "$room_idle" == "idle" ]]; then
-    encoded_room="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$ROOM_ID")"
-    last_body="$(python3 -c "
+# ── State-change dedup ──────────────────────────────────────────────────────
+# Embed a machine-readable tag in every post: [state:<tmux>/<room>]
+# If the last cron-bot message has the same tag, skip — nothing changed.
+STATE_TAG="state:${tmux_state}/${room_idle}"
+
+encoded_room="$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$ROOM_ID")"
+last_body="$(python3 -c "
 import urllib.request, json, sys
 url = sys.argv[1]
 token = sys.argv[2]
@@ -176,14 +165,13 @@ except Exception as e:
 " "${HOMESERVER}/_matrix/client/v3/rooms/${encoded_room}/messages?dir=b&limit=30" \
   "$ACCESS_TOKEN" "$CRON_BOT_USER" 2>/dev/null || echo "")"
 
-    if echo "$last_body" | grep -qF "$IDLE_MARKER"; then
-        # Last post was also idle/idle — skip
-        exit 0
-    fi
+if echo "$last_body" | grep -qF "[$STATE_TAG]"; then
+    # Last post had the same state — nothing changed, skip
+    exit 0
 fi
 
 # ── Format status message ───────────────────────────────────────────────────
-now_utc="$(date -u '+%Y-%m-%d %H:%M UTC')"
+now_local="$(date '+%Y-%m-%d %H:%M %Z')"
 
 case "$tmux_state" in
     active)   tmux_icon="⚙️" ;;
@@ -203,7 +191,7 @@ if [[ -n "$last_sender" && -n "$last_human_ts" ]]; then
     room_detail=" (last: $last_sender @ $last_human_ts)"
 fi
 
-message="**Detection Status** — ${now_utc}
+message="**Detection Status** — ${now_local}
 
 ${tmux_icon} **tmux**${tmux_detail}: \`${tmux_state}\`
 ${room_icon} **room**: \`${room_idle}\`${room_detail}"
@@ -211,8 +199,12 @@ ${room_icon} **room**: \`${room_idle}\`${room_detail}"
 if [[ "$tmux_state" == "idle" && "$room_idle" == "idle" ]]; then
     message="${message}
 
-_Both idle — triage would run if tickets exist. [$IDLE_MARKER]_"
+_Both idle — triage would run if tickets exist._"
 fi
+
+message="${message}
+
+_[$STATE_TAG]_"
 
 # ── Post ────────────────────────────────────────────────────────────────────
 if [[ "$DRY_RUN" == "1" ]]; then

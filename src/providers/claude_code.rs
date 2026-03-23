@@ -238,10 +238,15 @@ impl ClaudeCodeProvider {
     }
 
     /// Send a message to a tmux pane. Uses `set-buffer` + `paste-buffer` for
-    /// reliable delivery regardless of message length, then sends Enter.
+    /// reliable delivery regardless of message length.
+    ///
+    /// The trailing newline is included in the buffer itself so that the paste
+    /// is a single atomic operation — no separate `send-keys Enter` that could
+    /// race against the paste and get lost.
     async fn tmux_send_keys(target: &str, message: &str) -> anyhow::Result<()> {
         // Collapse to a single line — Claude Code interactive mode accepts single-line input.
-        let oneline = message.replace('\n', " ");
+        // Append newline so Enter is part of the paste (avoids race condition).
+        let oneline = format!("{}\n", message.replace('\n', " "));
 
         // set-buffer sets the content directly (no file needed), then paste into target pane.
         let set = tokio::process::Command::new("tmux")
@@ -263,23 +268,6 @@ impl ClaudeCodeProvider {
             let stderr = String::from_utf8_lossy(&paste.stderr);
             anyhow::bail!(
                 "tmux paste-buffer failed for '{}': {}",
-                target,
-                stderr.trim()
-            );
-        }
-
-        // Press Enter to submit
-        let enter = tokio::process::Command::new("tmux")
-            .args(["send-keys", "-t", target, "Enter"])
-            .output()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to send Enter to tmux pane '{}': {}", target, e)
-            })?;
-        if !enter.status.success() {
-            let stderr = String::from_utf8_lossy(&enter.stderr);
-            anyhow::bail!(
-                "tmux send-keys Enter failed for '{}': {}",
                 target,
                 stderr.trim()
             );
