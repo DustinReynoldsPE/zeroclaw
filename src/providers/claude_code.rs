@@ -182,6 +182,7 @@ pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &st
     let new_lines = &after_lines[new_start..];
 
     let mut result: Vec<String> = Vec::new();
+    let mut in_tool_block = false;
     for line in new_lines {
         let trimmed = line.trim();
 
@@ -192,7 +193,8 @@ pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &st
         // Strip the ⏺ marker prefix
         if let Some(rest) = trimmed.strip_prefix('\u{23FA}') {
             let content = rest.trim();
-            // Skip tool call lines
+            // Tool call line — skip it and all subsequent output until
+            // the next ⏺ response text line.
             if content.starts_with("Bash(")
                 || content.starts_with("Read(")
                 || content.starts_with("Write(")
@@ -205,24 +207,24 @@ pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &st
                 || content.starts_with("TodoWrite(")
                 || content.starts_with("Agent(")
             {
+                in_tool_block = true;
                 continue;
             }
+            // ⏺ line that isn't a tool call — this is response text
+            in_tool_block = false;
             if !content.is_empty() {
                 result.push(content.to_string());
             }
             continue;
         }
 
-        // Tool output lines (⎿ prefix): strip the marker but keep the content.
-        // Expand markers are still dropped.
-        if trimmed.contains("ctrl+o to expand") {
+        // Inside a tool block: skip all output (bash results, diffs, etc.)
+        if in_tool_block {
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('\u{23BF}') {
-            let content = rest.trim();
-            if !content.is_empty() {
-                result.push(content.to_string());
-            }
+
+        // Tool output markers outside a tracked block — skip
+        if trimmed.starts_with('\u{23BF}') || trimmed.contains("ctrl+o to expand") {
             continue;
         }
         if trimmed.starts_with("\u{2026}") || trimmed.starts_with("… +") {
