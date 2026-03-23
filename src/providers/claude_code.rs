@@ -99,8 +99,10 @@ pub(crate) fn tmux_is_chrome_line(line: &str) -> bool {
     if trimmed.contains('\u{2591}') || trimmed.contains('\u{2588}') {
         return true;
     }
-    // Thinking/reasoning indicators: "· Thinking…", "· Shimmying… (thought for 3s)"
-    if (trimmed.starts_with('\u{00B7}') || trimmed.starts_with("·"))
+    // Thinking/reasoning indicators using various bullet chars:
+    // · (U+00B7), ✻ (U+273B), ✳ (U+2733), ✽ (U+273D), ● (U+25CF), ⏺ (U+23FA)
+    let thinking_prefixes = ['\u{00B7}', '\u{273B}', '\u{2733}', '\u{273D}', '\u{25CF}'];
+    if thinking_prefixes.iter().any(|&c| trimmed.starts_with(c))
         && (trimmed.contains("hinking")
             || trimmed.contains("himmy")
             || trimmed.contains("thought for")
@@ -108,8 +110,14 @@ pub(crate) fn tmux_is_chrome_line(line: &str) -> bool {
     {
         return true;
     }
+    // "Searching for N pattern" / "ctrl+o to expand" markers
+    if trimmed.contains("ctrl+o to expand")
+        || (trimmed.starts_with("Searching for") && trimmed.contains("pattern"))
+    {
+        return true;
+    }
     // Status bar play/skip markers
-    if trimmed.starts_with("\u{23F5}") || trimmed.starts_with("\u{23F5}\u{23F5}") {
+    if trimmed.starts_with('\u{23F5}') {
         return true;
     }
     false
@@ -140,19 +148,30 @@ pub(crate) async fn tmux_capture_pane(target: &str) -> anyhow::Result<String> {
 pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &str) -> String {
     let after_lines: Vec<&str> = after.lines().collect();
 
-    if after_lines.len() <= before.lines().count() {
+    // Content-based check: if pane hasn't changed at all, nothing new.
+    if after == before {
         return String::new();
     }
 
     let sent_trimmed = sent_message.trim();
 
-    let before_lines: Vec<&str> = before.lines().collect();
+    // Find where new content starts by locating the echoed prompt line.
+    // Fall back to finding the first line that differs from the baseline.
     let prompt_needle = format!("\u{276F} {}", sent_trimmed);
     let new_start = after_lines
         .iter()
         .rposition(|line| line.trim() == prompt_needle.trim())
         .map(|i| i + 1)
-        .unwrap_or(before_lines.len());
+        .unwrap_or_else(|| {
+            // Prompt scrolled off — find first divergence from before
+            let before_lines: Vec<&str> = before.lines().collect();
+            for (i, line) in after_lines.iter().enumerate() {
+                if before_lines.get(i).map_or(true, |bl| bl != line) {
+                    return i;
+                }
+            }
+            after_lines.len()
+        });
 
     if new_start >= after_lines.len() {
         return String::new();
