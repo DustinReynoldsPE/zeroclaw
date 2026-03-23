@@ -3196,9 +3196,78 @@ async fn process_channel_message(
     } else {
         history.extend(prior_turns);
     }
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+
+    // Spawn live tmux pane streaming: sends filtered response text as new Matrix messages
+    // while the provider polls the pane internally.
+    let tmux_live_cancel = CancellationToken::new();
+    let tmux_live_task = if is_tmux_routed {
+        if let (Some(ref tmux_tgt), Some(channel_ref)) = (&tmux_target, target_channel.as_ref()) {
+            let target = tmux_tgt.clone();
+            let channel = Arc::clone(channel_ref);
+            let reply_target = msg.reply_target.clone();
+            let thread_ts = msg.thread_ts.clone();
+            let sent_message = user_content.clone();
+            let cancel = tmux_live_cancel.clone();
+            // Capture baseline before the provider sends the prompt — the provider
+            // will take its own baseline, but we need ours before spawning.
+            let baseline = crate::providers::claude_code::tmux_capture_pane(&target)
+                .await
+                .unwrap_or_default();
+            Some(tokio::spawn(async move {
+                let mut last_sent_text = String::new();
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                    let snapshot =
+                        match crate::providers::claude_code::tmux_capture_pane(&target).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!("tmux live poll failed: {e}");
+                                continue;
+                            }
+                        };
+                    let filtered = crate::providers::claude_code::filter_tmux_pane_text(
+                        &baseline,
+                        &snapshot,
+                        &sent_message,
+                    );
+                    if filtered.is_empty() || filtered == last_sent_text {
+                        continue;
+                    }
+                    // Find new text beyond what we already sent
+                    let new_text = if filtered.starts_with(&last_sent_text) {
+                        filtered[last_sent_text.len()..].trim().to_string()
+                    } else {
+                        // Content was restructured (e.g. earlier lines scrolled off) — send all
+                        filtered.clone()
+                    };
+                    if new_text.is_empty() {
+                        continue;
+                    }
+                    let _ = channel
+                        .send(
+                            &SendMessage::new(&new_text, &reply_target)
+                                .in_thread(thread_ts.clone()),
+                        )
+                        .await;
+                    last_sent_text = filtered;
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Disable draft streaming for tmux-routed messages — the live polling task
+    // sends new messages directly instead of editing a draft in-place.
+    let use_streaming = !is_tmux_routed
+        && target_channel
+            .as_ref()
+            .is_some_and(|ch| ch.supports_draft_updates());
 
     tracing::debug!(
         channel = %msg.channel,
@@ -3367,6 +3436,12 @@ async fn process_channel_message(
     };
 
     if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
+
+    // Stop tmux live streaming now that the provider has returned.
+    tmux_live_cancel.cancel();
+    if let Some(handle) = tmux_live_task {
         let _ = handle.await;
     }
 

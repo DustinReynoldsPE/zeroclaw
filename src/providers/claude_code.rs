@@ -71,6 +71,185 @@ pub struct ClaudeCodeProvider {
     sessions_file: Option<PathBuf>,
 }
 
+/// Check if a line looks like Claude Code's interactive prompt (idle, ready for input).
+pub(crate) fn tmux_is_claude_prompt_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == "\u{276F}"
+        || trimmed.starts_with("\u{276F} ")
+        || trimmed == ">"
+        || trimmed.ends_with("> ")
+        || (trimmed.ends_with('>') && !trimmed.contains('<') && !trimmed.contains("```"))
+}
+
+/// Check if a line is Claude Code UI chrome (separator, status bar, thinking, etc.).
+pub(crate) fn tmux_is_chrome_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    // Separator lines — mostly ─ (U+2500) chars, possibly with embedded text
+    if trimmed.len() > 40 {
+        let dash_count = trimmed.chars().filter(|&c| c == '\u{2500}').count();
+        if dash_count > 30 {
+            return true;
+        }
+    }
+    // Status bar lines (context %, timer, model info, permissions)
+    if trimmed.contains("context]") || trimmed.contains("bypass permissions") {
+        return true;
+    }
+    // Progress bar patterns
+    if trimmed.contains('\u{2591}') || trimmed.contains('\u{2588}') {
+        return true;
+    }
+    // Thinking/reasoning indicators using various bullet chars:
+    // · (U+00B7), ✻ (U+273B), ✳ (U+2733), ✽ (U+273D), ● (U+25CF), ⏺ (U+23FA)
+    let thinking_prefixes = [
+        '\u{00B7}', '\u{273B}', '\u{2733}', '\u{273D}', '\u{25CF}', '\u{2736}',
+    ];
+    if thinking_prefixes.iter().any(|&c| trimmed.starts_with(c))
+        && (trimmed.contains("hinking")
+            || trimmed.contains("himmy")
+            || trimmed.contains("thought for")
+            || trimmed.contains("\u{2026}"))
+    {
+        return true;
+    }
+    // "Searching for N pattern" / "ctrl+o to expand" markers
+    if trimmed.contains("ctrl+o to expand")
+        || (trimmed.starts_with("Searching for") && trimmed.contains("pattern"))
+    {
+        return true;
+    }
+    // Status bar play/skip markers
+    if trimmed.starts_with('\u{23F5}') {
+        return true;
+    }
+    false
+}
+
+/// Capture the contents of a tmux pane (last 500 lines of scrollback).
+pub(crate) async fn tmux_capture_pane(target: &str) -> anyhow::Result<String> {
+    let output = tokio::process::Command::new("tmux")
+        .args(["capture-pane", "-t", target, "-p", "-S", "-500"])
+        .output()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to capture tmux pane '{}': {}", target, e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "tmux capture-pane failed for '{}': {}",
+            target,
+            stderr.trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Extract Claude's response text from before/after pane snapshots.
+///
+/// Filters out UI chrome, tool calls, tool output, and prompt lines.
+/// Returns only the human-readable response text.
+pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &str) -> String {
+    let after_lines: Vec<&str> = after.lines().collect();
+
+    // Content-based check: if pane hasn't changed at all, nothing new.
+    if after == before {
+        return String::new();
+    }
+
+    let sent_trimmed = sent_message.trim();
+
+    // Find where new content starts by locating the echoed prompt line.
+    // Fall back to finding the first line that differs from the baseline.
+    let prompt_needle = format!("\u{276F} {}", sent_trimmed);
+    let new_start = after_lines
+        .iter()
+        .rposition(|line| line.trim() == prompt_needle.trim())
+        .map(|i| i + 1)
+        .unwrap_or_else(|| {
+            // Prompt scrolled off — find first divergence from before
+            let before_lines: Vec<&str> = before.lines().collect();
+            for (i, line) in after_lines.iter().enumerate() {
+                if before_lines.get(i).map_or(true, |bl| bl != line) {
+                    return i;
+                }
+            }
+            after_lines.len()
+        });
+
+    if new_start >= after_lines.len() {
+        return String::new();
+    }
+
+    let new_lines = &after_lines[new_start..];
+
+    let mut result: Vec<String> = Vec::new();
+    let mut in_tool_block = false;
+    for line in new_lines {
+        let trimmed = line.trim();
+
+        if tmux_is_claude_prompt_line(trimmed) || tmux_is_chrome_line(trimmed) {
+            continue;
+        }
+
+        // Strip the ⏺ marker prefix
+        if let Some(rest) = trimmed.strip_prefix('\u{23FA}') {
+            let content = rest.trim();
+            // Tool call line — skip it and all subsequent output until
+            // the next ⏺ response text line.
+            if content.starts_with("Bash(")
+                || content.starts_with("Read(")
+                || content.starts_with("Write(")
+                || content.starts_with("Edit(")
+                || content.starts_with("Update(")
+                || content.starts_with("Glob(")
+                || content.starts_with("Grep(")
+                || content.starts_with("Web Search(")
+                || content.starts_with("Searched for")
+                || content.starts_with("TodoWrite(")
+                || content.starts_with("Agent(")
+            {
+                in_tool_block = true;
+                continue;
+            }
+            // ⏺ line that isn't a tool call — this is response text
+            in_tool_block = false;
+            if !content.is_empty() {
+                result.push(content.to_string());
+            }
+            continue;
+        }
+
+        // Inside a tool block: skip all output (bash results, diffs, etc.)
+        if in_tool_block {
+            continue;
+        }
+
+        // Tool output markers outside a tracked block — skip
+        if trimmed.starts_with('\u{23BF}') || trimmed.contains("ctrl+o to expand") {
+            continue;
+        }
+        if trimmed.starts_with("\u{2026}") || trimmed.starts_with("… +") {
+            continue;
+        }
+        if trimmed.starts_with("Read ") && trimmed.contains("file") {
+            continue;
+        }
+        if trimmed.starts_with("Did ") && trimmed.contains("search") {
+            continue;
+        }
+
+        result.push(trimmed.to_string());
+    }
+
+    while result.last().is_some_and(|l| {
+        let t = l.trim();
+        t.is_empty() || tmux_is_claude_prompt_line(t) || tmux_is_chrome_line(t)
+    }) {
+        result.pop();
+    }
+
+    result.join("\n").trim().to_string()
+}
+
 impl ClaudeCodeProvider {
     pub fn new() -> Self {
         Self::with_state_dir(None)
@@ -208,41 +387,14 @@ impl ClaudeCodeProvider {
         (None, message)
     }
 
-    /// Check if a line looks like Claude Code's interactive prompt (idle, ready for input).
     fn is_claude_prompt_line(line: &str) -> bool {
-        let trimmed = line.trim();
-        // Claude Code uses ❯ (U+276F) as its prompt character
-        trimmed == "\u{276F}"
-            || trimmed.starts_with("\u{276F} ")
-            || trimmed == ">"
-            || trimmed.ends_with("> ")
-            || (trimmed.ends_with('>') && !trimmed.contains('<') && !trimmed.contains("```"))
+        tmux_is_claude_prompt_line(line)
     }
 
-    /// Capture the contents of a tmux pane (last 500 lines of scrollback).
     async fn tmux_capture_pane(target: &str) -> anyhow::Result<String> {
-        let output = tokio::process::Command::new("tmux")
-            .args(["capture-pane", "-t", target, "-p", "-S", "-500"])
-            .output()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to capture tmux pane '{}': {}", target, e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!(
-                "tmux capture-pane failed for '{}': {}",
-                target,
-                stderr.trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        tmux_capture_pane(target).await
     }
 
-    /// Send a message to a tmux pane. Uses `set-buffer` + `paste-buffer` for
-    /// reliable delivery regardless of message length.
-    ///
-    /// The trailing newline is included in the buffer itself so that the paste
-    /// is a single atomic operation — no separate `send-keys Enter` that could
-    /// race against the paste and get lost.
     async fn tmux_send_keys(target: &str, message: &str) -> anyhow::Result<()> {
         // Collapse to a single line — Claude Code interactive mode accepts single-line input.
         // Append newline so Enter is part of the paste (avoids race condition).
@@ -275,112 +427,12 @@ impl ClaudeCodeProvider {
         Ok(())
     }
 
-    /// Check if a line is Claude Code UI chrome (separator, status bar, etc.).
     fn is_chrome_line(line: &str) -> bool {
-        let trimmed = line.trim();
-        // Full-width separator lines (────) — only match lines that are purely ─ chars
-        // and long enough to be a UI separator (not a table border which mixes │┼├ etc.)
-        if trimmed.len() > 40 && trimmed.chars().all(|c| c == '\u{2500}') {
-            return true;
-        }
-        // Status bar lines (context %, timer, model info)
-        if trimmed.contains("context]") || trimmed.contains("bypass permissions") {
-            return true;
-        }
-        // Progress bar patterns
-        if trimmed.contains('\u{2591}') || trimmed.contains('\u{2588}') {
-            return true;
-        }
-        false
+        tmux_is_chrome_line(line)
     }
 
-    /// Extract Claude's response from before/after pane snapshots.
     fn extract_tmux_response(before: &str, after: &str, sent_message: &str) -> String {
-        let after_lines: Vec<&str> = after.lines().collect();
-
-        if after_lines.len() <= before.lines().count() {
-            return String::new();
-        }
-
-        let sent_trimmed = sent_message.trim();
-
-        // Find where the new content starts by looking for the echoed prompt line.
-        // This is more reliable than counting lines since tmux may reuse screen space.
-        let before_lines: Vec<&str> = before.lines().collect();
-        let prompt_needle = format!("\u{276F} {}", sent_trimmed);
-        let new_start = after_lines
-            .iter()
-            .rposition(|line| line.trim() == prompt_needle.trim())
-            .map(|i| i + 1)
-            .unwrap_or(before_lines.len());
-
-        if new_start >= after_lines.len() {
-            return String::new();
-        }
-
-        let new_lines = &after_lines[new_start..];
-
-        // Filter out Claude Code UI chrome and extract just the response text.
-        // Lines starting with ⏺ are Claude's output markers — keep the content after ⏺.
-        let mut result: Vec<String> = Vec::new();
-        for line in new_lines {
-            let trimmed = line.trim();
-
-            // Skip prompt lines, chrome, tool calls, and tool output — but don't break,
-            // since Claude interleaves tool calls with response text.
-            if Self::is_claude_prompt_line(trimmed) || Self::is_chrome_line(trimmed) {
-                continue;
-            }
-
-            // Strip the ⏺ marker prefix
-            if let Some(rest) = trimmed.strip_prefix('\u{23FA}') {
-                let content = rest.trim();
-                // Skip tool call lines like "Bash(command)"
-                if content.starts_with("Bash(")
-                    || content.starts_with("Read(")
-                    || content.starts_with("Write(")
-                    || content.starts_with("Edit(")
-                    || content.starts_with("Glob(")
-                    || content.starts_with("Grep(")
-                    || content.starts_with("Web Search(")
-                    || content.starts_with("Searched for")
-                {
-                    continue;
-                }
-                if !content.is_empty() {
-                    result.push(content.to_string());
-                }
-                continue;
-            }
-
-            // Skip tool output lines (⎿ prefix) and expand markers
-            if trimmed.starts_with('\u{23BF}') || trimmed.contains("ctrl+o to expand") {
-                continue;
-            }
-            // Skip +N lines markers and "Read N file" markers
-            if trimmed.starts_with("\u{2026}") || trimmed.starts_with("… +") {
-                continue;
-            }
-            if trimmed.starts_with("Read ") && trimmed.contains("file") {
-                continue;
-            }
-            // Skip "Did N search" markers
-            if trimmed.starts_with("Did ") && trimmed.contains("search") {
-                continue;
-            }
-
-            result.push(trimmed.to_string());
-        }
-
-        // Trim trailing empty lines and any remaining chrome at the end
-        while result.last().is_some_and(|l| {
-            let t = l.trim();
-            t.is_empty() || Self::is_claude_prompt_line(t) || Self::is_chrome_line(t)
-        }) {
-            result.pop();
-        }
-
-        result.join("\n").trim().to_string()
+        filter_tmux_pane_text(before, after, sent_message)
     }
 
     /// Route a message through an interactive Claude session in a tmux pane.
@@ -404,29 +456,49 @@ impl ClaudeCodeProvider {
             tokio::time::sleep(POLL_INTERVAL).await;
 
             if tokio::time::Instant::now() > deadline {
-                anyhow::bail!(
-                    "Tmux Claude session at '{}' did not respond within {:?}",
+                let partial = Self::extract_tmux_response(&before, &last_snapshot, message);
+                tracing::warn!(
                     target,
-                    RESPONSE_TIMEOUT,
+                    partial_len = partial.len(),
+                    "Tmux response timed out, returning partial"
                 );
+                return Ok(partial);
             }
 
             let snapshot = Self::tmux_capture_pane(target).await?;
 
-            // Check if output has new content beyond the before snapshot
-            let has_new_content = snapshot.lines().count() > before.lines().count();
+            // Check if the pane content differs from the baseline.
+            // Line-count comparison is unreliable when the terminal scrolls
+            // (pane height stays constant), so compare content directly.
+            let has_new_content = snapshot != before;
 
-            // Check if the prompt has reappeared near the end.
-            // Claude Code's status bar occupies the last few lines, so check
-            // the last 5 lines for the ❯ prompt.
-            let ends_with_prompt = snapshot
-                .trim_end()
-                .lines()
-                .rev()
-                .take(5)
-                .any(Self::is_claude_prompt_line);
+            // Detect response completion. Claude Code's UI always shows a bare ❯
+            // in the input area at the bottom of the screen, even while actively
+            // working — so checking for ❯ causes false positives. Instead, look
+            // for the "Worked for" completion marker that Claude emits after
+            // finishing a response (e.g. "✻ Worked for 1m 29s"). For non-Claude
+            // shells (plain bash/zsh with ❯ prompt), also accept a bare ❯ that
+            // appears AFTER new content (not just the echoed command line).
+            let response_complete = snapshot.lines().rev().take(15).any(|line| {
+                let t = line.trim();
+                // Claude Code completion: "✻ Worked for 57s", "· Worked for 2m 3s"
+                if t.contains("Worked for") {
+                    return true;
+                }
+                false
+            }) || {
+                // Fallback for non-Claude shells: the LAST non-empty line
+                // must be a bare ❯ (command finished, shell ready for input).
+                let last_nonempty = snapshot
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                let t = last_nonempty.trim();
+                t == "\u{276F}" || t == "\u{276F} "
+            };
 
-            if has_new_content && ends_with_prompt && snapshot == last_snapshot {
+            if has_new_content && response_complete && snapshot == last_snapshot {
                 stable_count += 1;
                 if stable_count >= 2 {
                     let response = Self::extract_tmux_response(&before, &snapshot, message);
