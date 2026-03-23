@@ -197,10 +197,13 @@ pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &st
                 || content.starts_with("Read(")
                 || content.starts_with("Write(")
                 || content.starts_with("Edit(")
+                || content.starts_with("Update(")
                 || content.starts_with("Glob(")
                 || content.starts_with("Grep(")
                 || content.starts_with("Web Search(")
                 || content.starts_with("Searched for")
+                || content.starts_with("TodoWrite(")
+                || content.starts_with("Agent(")
             {
                 continue;
             }
@@ -210,8 +213,16 @@ pub(crate) fn filter_tmux_pane_text(before: &str, after: &str, sent_message: &st
             continue;
         }
 
-        // Skip tool output lines (⎿ prefix) and expand markers
-        if trimmed.starts_with('\u{23BF}') || trimmed.contains("ctrl+o to expand") {
+        // Tool output lines (⎿ prefix): strip the marker but keep the content.
+        // Expand markers are still dropped.
+        if trimmed.contains("ctrl+o to expand") {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('\u{23BF}') {
+            let content = rest.trim();
+            if !content.is_empty() {
+                result.push(content.to_string());
+            }
             continue;
         }
         if trimmed.starts_with("\u{2026}") || trimmed.starts_with("… +") {
@@ -459,16 +470,36 @@ impl ClaudeCodeProvider {
             // (pane height stays constant), so compare content directly.
             let has_new_content = snapshot != before;
 
-            // Check if an idle prompt has reappeared near the end.
-            // Must be a BARE ❯ (empty prompt ready for input), not an echoed
-            // command line like "❯ echo hello" — otherwise we'd falsely detect
-            // completion while a command is still running.
-            let ends_with_prompt = snapshot.trim_end().lines().rev().take(5).any(|line| {
+            // Detect response completion. Claude Code's UI always shows a bare ❯
+            // in the input area at the bottom of the screen, even while actively
+            // working — so checking for ❯ causes false positives. Instead, look
+            // for the "Worked for" completion marker that Claude emits after
+            // finishing a response (e.g. "✻ Worked for 1m 29s"). For non-Claude
+            // shells (plain bash/zsh with ❯ prompt), also accept a bare ❯ that
+            // appears AFTER new content (not just the echoed command line).
+            let response_complete = snapshot.lines().rev().take(15).any(|line| {
                 let t = line.trim();
-                t == "\u{276F}" || t == "\u{276F} "
-            });
+                // Claude Code completion: "✻ Worked for 57s", "· Worked for 2m 3s"
+                if t.contains("Worked for") {
+                    return true;
+                }
+                false
+            }) || {
+                // Fallback for non-Claude shells: bare ❯ in last 5 lines,
+                // but only if the echoed command line is NOT in those same lines
+                // (meaning the shell has printed output and returned to prompt).
+                let last_lines: Vec<&str> = snapshot.trim_end().lines().rev().take(5).collect();
+                let has_bare_prompt = last_lines
+                    .iter()
+                    .any(|l| l.trim() == "\u{276F}" || l.trim() == "\u{276F} ");
+                let has_echoed_cmd = last_lines.iter().any(|l| {
+                    let t = l.trim();
+                    t.starts_with("\u{276F} ") && t.len() > 3
+                });
+                has_bare_prompt && !has_echoed_cmd
+            };
 
-            if has_new_content && ends_with_prompt && snapshot == last_snapshot {
+            if has_new_content && response_complete && snapshot == last_snapshot {
                 stable_count += 1;
                 if stable_count >= 2 {
                     let response = Self::extract_tmux_response(&before, &snapshot, message);
