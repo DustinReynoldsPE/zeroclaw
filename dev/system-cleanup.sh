@@ -62,8 +62,8 @@ echo
 
 # ── 3. pip cache ───────────────────────────────────────────────────────────
 log "=== pip cache ==="
-pip_cache_dir="$HOME/Library/Caches/pip"
-if [[ -d "$pip_cache_dir" ]]; then
+pip_cache_dir="$(python3 -m pip cache dir 2>/dev/null || true)"
+if [[ -n "$pip_cache_dir" && -d "$pip_cache_dir" ]]; then
     size=$(du -sk "$pip_cache_dir" 2>/dev/null | awk '{print $1}')
     if (( size > 102400 )); then
         if [[ "$DRY_RUN" == "--dry-run" ]]; then
@@ -105,8 +105,8 @@ echo
 # ── 5. uv cache ───────────────────────────────────────────────────────────
 log "=== uv cache ==="
 if command -v uv &>/dev/null; then
-    uv_cache="$HOME/.local/share/uv"
-    if [[ -d "$uv_cache" ]]; then
+    uv_cache="$(uv cache dir 2>/dev/null || true)"
+    if [[ -n "$uv_cache" && -d "$uv_cache" ]]; then
         size=$(du -sk "$uv_cache" 2>/dev/null | awk '{print $1}')
         if (( size > 102400 )); then
             if [[ "$DRY_RUN" == "--dry-run" ]]; then
@@ -126,8 +126,8 @@ echo
 
 # ── 6. pnpm cache ─────────────────────────────────────────────────────────
 log "=== pnpm cache ==="
-pnpm_cache="$HOME/Library/Caches/pnpm"
-if [[ -d "$pnpm_cache" ]]; then
+pnpm_cache="$(pnpm store path 2>/dev/null || true)"
+if [[ -n "$pnpm_cache" && -d "$pnpm_cache" ]]; then
     size=$(du -sk "$pnpm_cache" 2>/dev/null | awk '{print $1}')
     if (( size > 102400 )); then
         if [[ "$DRY_RUN" == "--dry-run" ]]; then
@@ -144,8 +144,8 @@ echo
 
 # ── 7. Go build cache ────────────────────────────────────────────────────
 log "=== Go build cache ==="
-go_cache="$HOME/Library/Caches/go-build"
-if [[ -d "$go_cache" ]]; then
+go_cache="$(go env GOCACHE 2>/dev/null || true)"
+if [[ -n "$go_cache" && -d "$go_cache" ]]; then
     size=$(du -sk "$go_cache" 2>/dev/null | awk '{print $1}')
     if (( size > 102400 )); then
         if [[ "$DRY_RUN" == "--dry-run" ]]; then

@@ -153,6 +153,36 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 ./dev/cli.sh ci lint
 ```
 
+---
+
+## Disk Cleanup Cron Jobs
+
+Two host-level cron jobs reclaim disk space from build artifacts and package manager caches. They run via the user crontab and work on both macOS and Linux.
+
+### Install
+
+```bash
+./dev/install-cron.sh           # install or update
+./dev/install-cron.sh --remove  # remove all zeroclaw cron entries
+```
+
+### Jobs
+
+| Schedule | Script | Purpose |
+|---|---|---|
+| Daily at 4:17 AM | `dev/cargo-clean-stale.sh` | Removes incremental Cargo caches and stale `.o`/`.rlib`/`.rmeta` files older than 7 days from the zeroclaw `target/` dir |
+| Weekly Sunday at 4:23 AM | `dev/system-cleanup.sh` | Full sweep: Cargo (as above) + all other Rust project targets >500 MB + pip, Homebrew, uv, pnpm, and Go build caches |
+
+Both scripts are safe to run at any time and support `--dry-run` to preview what would be removed.
+
+Logs:
+- `dev/cargo-clean-stale.sh` → `/tmp/cargo-clean.log`
+- `dev/system-cleanup.sh` → `/tmp/system-cleanup.log`
+
+Threshold tuning: set `CARGO_STALE_DAYS=N` to override the default 7-day age cutoff for stale dep files.
+
+---
+
 ### Isolation model
 
 - Rust compilation, tests, and audit/deny tools run in `zeroclaw-local-ci` container.
