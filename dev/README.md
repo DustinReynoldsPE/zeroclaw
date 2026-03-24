@@ -155,6 +155,40 @@ Note: local `deny` focuses on license/source policy; advisory scanning is handle
 
 ---
 
+## Migrating to a Remote Host
+
+`dev/migrate.sh` syncs your local ZeroClaw config to a remote machine, installs cron jobs there, and starts the daemon in a named tmux window.
+
+### Prerequisites on the remote
+
+- ZeroClaw binary built at `~/code/zeroclaw/target/release/zeroclaw`
+- `tmux` installed
+- SSH key auth configured (no interactive password prompts)
+
+### Usage
+
+```bash
+./dev/migrate.sh <[user@]host> [tmux-session:window]
+```
+
+```bash
+./dev/migrate.sh hpllm.local                  # defaults to main:zeroclaw
+./dev/migrate.sh hpllm.local main:zeroclaw    # explicit target
+./dev/migrate.sh user@192.168.1.50 dev:agent
+```
+
+Safe to re-run — config sync is incremental (`rsync --delete`) and the daemon is restarted cleanly.
+
+### What it does
+
+1. `rsync ~/.zeroclaw/` to the remote (excludes `tts_cache/`, `captures/`, `recordings/`, `claude_code_sessions.json`)
+2. Installs cron cleanup jobs via `dev/install-cron.sh` on the remote
+3. Stops any existing `zeroclaw daemon` process on the remote
+4. Creates the tmux session/window if absent, then starts `zeroclaw daemon` inside it
+5. Polls the gateway health endpoint and prints `zeroclaw status`
+
+---
+
 ## Disk Cleanup Cron Jobs
 
 Two host-level cron jobs reclaim disk space from build artifacts and package manager caches. They run via the user crontab and work on both macOS and Linux.
