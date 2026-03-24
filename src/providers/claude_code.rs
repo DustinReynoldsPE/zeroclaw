@@ -1164,6 +1164,27 @@ impl Provider for ClaudeCodeProvider {
         }
 
         if !has_resume {
+            let multi_turn = messages
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .count()
+                > 1;
+            if multi_turn {
+                // Format entire conversation as a role-tagged transcript so the
+                // model sees the full context without a separate history block.
+                full_message.clear();
+                use std::fmt::Write as _;
+                for msg in messages {
+                    match msg.role.as_str() {
+                        "system" | "user" | "assistant" => {
+                            let _ = write!(full_message, "[{}]\n{}\n", msg.role, msg.content);
+                        }
+                        _ => {}
+                    }
+                }
+                full_message.push_str("[assistant]");
+                return self.invoke_cli(&full_message, model).await;
+            }
             if let Some(ctx) = Self::format_history_as_context(messages) {
                 full_message.push_str(&ctx);
             }
@@ -1638,7 +1659,10 @@ mod tests {
             script_id
         ));
         let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
+        f.write_all(
+            b"#!/bin/sh\npython3 -c 'import json,sys;print(json.dumps({\"type\":\"result\",\"subtype\":\"success\",\"result\":sys.stdin.read(),\"is_error\":False,\"duration_ms\":0,\"num_turns\":1}))'\n",
+        )
+        .unwrap();
         f.sync_all().unwrap();
         drop(f);
         #[cfg(unix)]

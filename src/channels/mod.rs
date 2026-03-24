@@ -3455,8 +3455,12 @@ async fn process_channel_message(
         "⏱ Memory recall completed"
     );
 
-    let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+    let base_prompt = if force_fresh_session {
+        refreshed_new_session_system_prompt(ctx.as_ref())
+    } else {
+        ctx.system_prompt.as_str().to_string()
+    };
+    let system_prompt = build_channel_system_prompt(&base_prompt, &msg.channel, &msg.reply_target);
 
     // Resolve per-channel workspace: check room ID then channel name.
     let room_id_for_ws = extract_room_id(&msg.reply_target);
@@ -3503,6 +3507,13 @@ async fn process_channel_message(
             let _ = writeln!(s, "[ZEROCLAW_TMUX_TARGET:{}]", target);
         }
         s.push_str(&system_prompt);
+        if !sender_memory.is_empty() {
+            s.push('\n');
+            s.push_str(&sender_memory);
+        }
+        if !group_memory.is_empty() {
+            s.push_str(&group_memory);
+        }
         s
     };
 
