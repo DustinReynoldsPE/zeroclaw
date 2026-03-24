@@ -48,11 +48,48 @@ log "Config sync complete."
 log "Fixing active_workspace.toml on ${HOST} ..."
 ssh "$HOST" 'echo "config_dir = \"$HOME/.zeroclaw\"" > ~/.zeroclaw/active_workspace.toml'
 
-# ── 2. Install cron jobs on remote ────────────────────────────────────────
+# ── 2. Detect required features and rebuild if needed ─────────────────────
+FEATURES=""
+if grep -q 'matrix\s*=\s*true' ~/.zeroclaw/config.toml 2>/dev/null; then
+    FEATURES="channel-matrix"
+fi
+
+log "Checking binary on ${HOST} ..."
+NEEDS_BUILD=0
+if ! ssh "$HOST" 'test -x $HOME/code/zeroclaw/target/release/zeroclaw' 2>/dev/null; then
+    log "No binary found — will build."
+    NEEDS_BUILD=1
+elif [[ -n "$FEATURES" ]]; then
+    # Verify the existing binary includes the required features
+    if ! ssh "$HOST" '$HOME/code/zeroclaw/target/release/zeroclaw --version' &>/dev/null; then
+        NEEDS_BUILD=1
+    else
+        BUILT_WITH=$(ssh "$HOST" 'strings $HOME/code/zeroclaw/target/release/zeroclaw 2>/dev/null | grep -o "channel-matrix" | head -1 || true')
+        if [[ "$BUILT_WITH" != "channel-matrix" ]]; then
+            log "Binary missing feature 'channel-matrix' — rebuilding."
+            NEEDS_BUILD=1
+        fi
+    fi
+fi
+
+if [[ "$NEEDS_BUILD" -eq 1 ]]; then
+    CARGO="$HOME/.cargo/bin/cargo"
+    BUILD_CMD="cd \$HOME/code/zeroclaw && $CARGO build --release"
+    [[ -n "$FEATURES" ]] && BUILD_CMD="$BUILD_CMD --features $FEATURES"
+    log "Building on ${HOST} (features: ${FEATURES:-none}) — this may take a few minutes ..."
+    # Run in foreground so we see errors
+    # shellcheck disable=SC2029
+    ssh "$HOST" "bash -c '$BUILD_CMD'" 2>&1
+    log "Build complete."
+else
+    log "Binary OK — skipping rebuild."
+fi
+
+# ── 3. Install cron jobs on remote ────────────────────────────────────────
 log "Installing cron jobs on ${HOST} ..."
 ssh "$HOST" "bash ~/code/zeroclaw/dev/install-cron.sh"
 
-# ── 3. Start daemon in tmux window ────────────────────────────────────────
+# ── 5. Start daemon in tmux window ────────────────────────────────────────
 log "Starting daemon in tmux '${TMUX_TARGET}' on ${HOST} ..."
 ssh "$HOST" bash -s "$SESSION" "$WINDOW" <<'REMOTE'
 set -euo pipefail
@@ -83,7 +120,7 @@ tmux send-keys -t "$TARGET" "cd ~/code/zeroclaw && ./target/release/zeroclaw dae
 echo "[remote] Daemon started in '${TARGET}'"
 REMOTE
 
-# ── 4. Health check ───────────────────────────────────────────────────────
+# ── 6. Health check ───────────────────────────────────────────────────────
 log "Waiting for gateway ..."
 for i in $(seq 1 10); do
     if ssh "$HOST" "curl -sf http://127.0.0.1:42617/health" &>/dev/null; then
@@ -98,7 +135,7 @@ for i in $(seq 1 10); do
     sleep 1
 done
 
-# ── 5. Status ─────────────────────────────────────────────────────────────
+# ── 7. Status ─────────────────────────────────────────────────────────────
 log "Running zeroclaw status on ${HOST} ..."
 ssh "$HOST" '$HOME/code/zeroclaw/target/release/zeroclaw status' 2>&1 || true
 
