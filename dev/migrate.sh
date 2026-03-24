@@ -44,6 +44,10 @@ rsync -av --delete \
     ~/.zeroclaw/ "${HOST}:~/.zeroclaw/"
 log "Config sync complete."
 
+# ── 1b. Rewrite active_workspace.toml with remote $HOME ───────────────────
+log "Fixing active_workspace.toml on ${HOST} ..."
+ssh "$HOST" 'echo "config_dir = \"$HOME/.zeroclaw\"" > ~/.zeroclaw/active_workspace.toml'
+
 # ── 2. Install cron jobs on remote ────────────────────────────────────────
 log "Installing cron jobs on ${HOST} ..."
 ssh "$HOST" "bash ~/code/zeroclaw/dev/install-cron.sh"
