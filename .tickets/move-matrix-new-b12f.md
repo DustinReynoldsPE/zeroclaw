@@ -1,13 +1,14 @@
 ---
 id: move-matrix-new-b12f
-stage: test
+stage: done
 deps: []
 links: []
 created: 2026-03-20T17:19:20Z
 type: task
 priority: 2
 assignee: Dustin Reynolds
-version: 7
+skipped: [verify]
+version: 8
 ---
 # Move matrix to a new linux host, chat
 

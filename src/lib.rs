@@ -1,3 +1,5 @@
+// matrix-sdk's async fn type trees exceed the default depth limit on Rust ≥1.94.
+#![recursion_limit = "512"]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(
     clippy::assigning_clones,
