@@ -5204,6 +5204,7 @@ fn collect_configured_channels(
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
                 .with_allowed_rooms(config.channel_workspaces.keys().cloned())
+                .with_mcp_servers(config.mcp.servers.iter().map(|s| s.name.clone()).collect())
                 .with_transcription(Some(config.transcription.clone()))
                 .with_tts(Some(config.tts.clone())),
             ),

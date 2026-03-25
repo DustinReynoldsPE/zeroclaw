@@ -34,7 +34,6 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
-    allowed_rooms: Vec<String>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
@@ -52,6 +51,8 @@ pub struct MatrixChannel {
     /// Additional rooms to listen on (from channel_workspaces config).
     /// The configured `room_id` is always included implicitly.
     allowed_rooms: HashSet<String>,
+    /// MCP server names for dynamic help output.
+    mcp_server_names: Vec<String>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -205,7 +206,7 @@ impl MatrixChannel {
             .map(|user| user.trim().to_string())
             .filter(|user| !user.is_empty())
             .collect();
-        let allowed_rooms = allowed_rooms
+        let allowed_rooms: Vec<String> = allowed_rooms
             .into_iter()
             .map(|room| room.trim().to_string())
             .filter(|room| !room.is_empty())
@@ -216,7 +217,6 @@ impl MatrixChannel {
             access_token,
             room_id,
             allowed_users,
-            allowed_rooms,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             zeroclaw_dir,
@@ -230,7 +230,8 @@ impl MatrixChannel {
             tts_api_url: None,
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             draft_current_event: Arc::new(Mutex::new(None)),
-            allowed_rooms: HashSet::new(),
+            allowed_rooms: allowed_rooms.into_iter().collect(),
+            mcp_server_names: Vec::new(),
         }
     }
 
@@ -256,6 +257,12 @@ impl MatrixChannel {
             }
         }
         self.tts_config = config;
+        self
+    }
+
+    /// Set MCP server names for dynamic help output.
+    pub fn with_mcp_servers(mut self, names: Vec<String>) -> Self {
+        self.mcp_server_names = names;
         self
     }
 
@@ -364,7 +371,7 @@ impl MatrixChannel {
 
     /// Check whether a room (by its canonical ID) is in the allowed_rooms list.
     /// If allowed_rooms is empty, all rooms are allowed.
-    fn is_room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
+    fn is_room_allowed_static(allowed_rooms: &HashSet<String>, room_id: &str) -> bool {
         if allowed_rooms.is_empty() {
             return true;
         }
@@ -399,24 +406,34 @@ impl MatrixChannel {
             || t == "command"
     }
 
-    fn handle_help_command() -> String {
-        [
-            "**Zero-token commands** _(no LLM, instant)_",
-            "",
-            "**usage** — Claude Code quota bars with reset dates",
-            "**restart** — restart the zeroclaw daemon (zero-token)",
-            "**idle** — tmux state for all configured rooms (idle/active/question)",
-            "**cron** — list cron jobs for this room (checks tmux for pending questions)",
-            "**cron all** — list cron jobs for all rooms",
-            "**peek** `[N]` — last N lines of this room's tmux pane (default 20)",
-            "**history** `[N]` — last N Matrix messages in this room (default 10)",
-            "**ticket** `<subcommand>` — ticket management (`ticket help` for details)",
-            "**tmux** `<text>` — send text directly to the tmux pane for this room",
-            "**help** / **commands** — this help",
-            "",
-            "Prefix any other message to route to the agent.",
-        ]
-        .join("\n")
+    fn handle_help_command(mcp_server_names: &[String]) -> String {
+        let mut lines = vec![
+            "**Zero-token commands** _(no LLM, instant)_".to_string(),
+            String::new(),
+            "**usage** — Claude Code quota bars with reset dates".to_string(),
+            "**restart** — restart the zeroclaw daemon (zero-token)".to_string(),
+            "**idle** — tmux state for all configured rooms (idle/active/question)".to_string(),
+            "**cron** — list cron jobs for this room (checks tmux for pending questions)"
+                .to_string(),
+            "**cron all** — list cron jobs for all rooms".to_string(),
+            "**peek** `[N]` — last N lines of this room's tmux pane (default 20)".to_string(),
+            "**history** `[N]` — last N Matrix messages in this room (default 10)".to_string(),
+            "**ticket** `<subcommand>` — ticket management (`ticket help` for details)".to_string(),
+            "**tmux** `<text>` — send text directly to the tmux pane for this room".to_string(),
+            "**help** / **commands** — this help".to_string(),
+        ];
+
+        if !mcp_server_names.is_empty() {
+            lines.push(String::new());
+            lines.push("**MCP integrations** _(available to the agent)_".to_string());
+            for name in mcp_server_names {
+                lines.push(format!("• **{name}**"));
+            }
+        }
+
+        lines.push(String::new());
+        lines.push("Prefix any other message to route to the agent.".to_string());
+        lines.join("\n")
     }
 
     fn is_history_command(body: &str) -> bool {
@@ -515,29 +532,7 @@ impl MatrixChannel {
     }
 
     async fn fetch_oauth_usage() -> Option<String> {
-        // Retrieve the OAuth access token from macOS Keychain.
-        let keychain_output = tokio::process::Command::new("security")
-            .args([
-                "find-generic-password",
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ])
-            .output()
-            .await
-            .ok()?;
-
-        if !keychain_output.status.success() {
-            return None;
-        }
-
-        let json_str = String::from_utf8_lossy(&keychain_output.stdout);
-        let creds: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
-        let token = creds
-            .get("claudeAiOauth")?
-            .get("accessToken")?
-            .as_str()?
-            .to_string();
+        let token = Self::read_oauth_token().await?;
 
         // Call the usage endpoint.
         let resp = tokio::time::timeout(
@@ -564,8 +559,8 @@ impl MatrixChannel {
             let filled = filled.min(20);
             format!(
                 "{}{} {:.0}%",
-                "█".repeat(filled),
-                "░".repeat(20 - filled),
+                "=".repeat(filled),
+                "-".repeat(20 - filled),
                 pct
             )
         };
@@ -642,6 +637,54 @@ impl MatrixChannel {
         }
 
         Some(out.trim_end().to_string())
+    }
+
+    /// Read the Claude Code OAuth access token.
+    /// Tries the on-disk credentials file first (~/.claude/.credentials.json),
+    /// then falls back to the macOS Keychain for backward compatibility.
+    async fn read_oauth_token() -> Option<String> {
+        // Try on-disk credentials file (works on Linux and macOS).
+        if let Some(home) = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+        {
+            let creds_path = std::path::PathBuf::from(&home)
+                .join(".claude")
+                .join(".credentials.json");
+            if let Ok(contents) = tokio::fs::read_to_string(&creds_path).await {
+                if let Ok(creds) = serde_json::from_str::<serde_json::Value>(contents.trim()) {
+                    if let Some(token) = creds
+                        .get("claudeAiOauth")
+                        .and_then(|o| o.get("accessToken"))
+                        .and_then(|v| v.as_str())
+                    {
+                        return Some(token.to_string());
+                    }
+                }
+            }
+        }
+
+        // Fallback: macOS Keychain.
+        let keychain_output = tokio::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
+            .output()
+            .await
+            .ok()?;
+        if !keychain_output.status.success() {
+            return None;
+        }
+        let json_str = String::from_utf8_lossy(&keychain_output.stdout);
+        let creds: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
+        creds
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()
+            .map(|s| s.to_string())
     }
 
     /// Estimate cost in USD from token counts based on model name.
@@ -1052,6 +1095,8 @@ impl MatrixChannel {
                     channel: "matrix".to_string(),
                     timestamp: (ts / 1000) as u64,
                     thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
                 };
 
                 let _ = tx.send(msg).await;
@@ -1892,7 +1937,6 @@ impl Channel for MatrixChannel {
         let accepted_rooms_for_handler = Arc::new(accepted_rooms);
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
-        let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
@@ -1905,7 +1949,6 @@ impl Channel for MatrixChannel {
             let accepted_rooms = Arc::clone(&accepted_rooms_for_handler);
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
-            let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
@@ -2119,7 +2162,7 @@ impl Channel for MatrixChannel {
 
                 // Check for help/commands command (zero-token operation)
                 if MatrixChannel::is_help_command(&body) {
-                    let result = MatrixChannel::handle_help_command();
+                    let result = MatrixChannel::handle_help_command(&self.mcp_server_names);
                     send_zero_token!(result, "help");
                 }
 
