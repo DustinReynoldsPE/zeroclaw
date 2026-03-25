@@ -392,7 +392,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
 
 pub(crate) async fn deliver_announcement(
     config: &Config,
-    _delivery: &DeliveryConfig,
+    delivery: &DeliveryConfig,
     channel: &str,
     target: &str,
     output: &str,
@@ -488,8 +488,8 @@ pub(crate) async fn deliver_announcement(
                 // When overriding, pass None for device_id so matrix-sdk opens
                 // a fresh session rather than restoring the stored zeroclaw session.
                 let (access_token, user_id, device_id, zeroclaw_dir) =
-                    if let Some(tok) = _delivery.token.clone() {
-                        (tok, _delivery.user_id.clone(), None, None)
+                    if let Some(tok) = delivery.token.clone() {
+                        (tok, delivery.user_id.clone(), None, None)
                     } else {
                         (
                             mx.access_token.clone(),
@@ -667,16 +667,52 @@ fn build_cron_shell_command(
     command: &str,
     workspace_dir: &std::path::Path,
 ) -> anyhow::Result<Command> {
+    let zeroclaw_root = zeroclaw_root_dir();
+    let command = normalize_home_paths(command, &zeroclaw_root);
+
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg(command)
+        .arg(&command)
         .current_dir(workspace_dir)
+        .env("ZEROCLAW_ROOT", &zeroclaw_root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     Ok(cmd)
+}
+
+/// Derive the repository root from the running binary path.
+/// Binary lives at `<repo>/target/{debug,release}/zeroclaw`, so we walk up
+/// to find the ancestor that contains a `services/` directory.
+fn zeroclaw_root_dir() -> String {
+    if let Ok(exe) = std::env::current_exe() {
+        // Walk up from the binary looking for the repo root (has services/ dir)
+        let mut dir = exe.as_path();
+        for _ in 0..5 {
+            if let Some(parent) = dir.parent() {
+                dir = parent;
+                if dir.join("services").is_dir() {
+                    return dir.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+    // Fallback: $HOME/code/zeroclaw
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{home}/code/zeroclaw")
+}
+
+/// Replace hardcoded home-directory prefixes in cron commands with the
+/// actual repo root, so jobs created on macOS work on Linux and vice versa.
+fn normalize_home_paths(command: &str, zeroclaw_root: &str) -> String {
+    use std::sync::LazyLock;
+    // Match /Users/<user>/code/zeroclaw or /home/<user>/code/zeroclaw
+    static RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"/(Users|home)/[^/]+/code/zeroclaw\b").expect("static regex")
+    });
+    RE.replace_all(command, zeroclaw_root).into_owned()
 }
 
 #[cfg(test)]
@@ -1352,5 +1388,58 @@ mod tests {
         // all_overdue_jobs ignores the limit
         let overdue = cron::all_overdue_jobs(&config, far_future).unwrap();
         assert_eq!(overdue.len(), 3, "all_overdue_jobs must return all");
+    }
+
+    #[test]
+    fn normalize_home_paths_rewrites_macos_to_linux() {
+        let root = "/home/dustin/code/zeroclaw";
+        let cmd = "bash /Users/dustin/code/zeroclaw/services/cron-bot-status.sh !room:matrix.local";
+        let result = super::normalize_home_paths(cmd, root);
+        assert_eq!(
+            result,
+            "bash /home/dustin/code/zeroclaw/services/cron-bot-status.sh !room:matrix.local"
+        );
+    }
+
+    #[test]
+    fn normalize_home_paths_rewrites_linux_to_macos() {
+        let root = "/Users/dustin/code/zeroclaw";
+        let cmd = "bash /home/deploy/code/zeroclaw/services/cron-bot-status.sh";
+        let result = super::normalize_home_paths(cmd, root);
+        assert_eq!(
+            result,
+            "bash /Users/dustin/code/zeroclaw/services/cron-bot-status.sh"
+        );
+    }
+
+    #[test]
+    fn normalize_home_paths_preserves_subpaths() {
+        let root = "/home/dustin/code/zeroclaw";
+        let cmd = "bash /Users/bob/code/zeroclaw/services/deep/nested/script.sh";
+        let result = super::normalize_home_paths(cmd, root);
+        assert_eq!(
+            result,
+            "bash /home/dustin/code/zeroclaw/services/deep/nested/script.sh"
+        );
+    }
+
+    #[test]
+    fn normalize_home_paths_no_match_unchanged() {
+        let root = "/home/dustin/code/zeroclaw";
+        let cmd = "echo hello world";
+        let result = super::normalize_home_paths(cmd, root);
+        assert_eq!(result, "echo hello world");
+    }
+
+    #[test]
+    fn normalize_home_paths_multiple_occurrences() {
+        let root = "/home/dustin/code/zeroclaw";
+        let cmd =
+            "/Users/bob/code/zeroclaw/services/a.sh && /Users/bob/code/zeroclaw/services/b.sh";
+        let result = super::normalize_home_paths(cmd, root);
+        assert_eq!(
+            result,
+            "/home/dustin/code/zeroclaw/services/a.sh && /home/dustin/code/zeroclaw/services/b.sh"
+        );
     }
 }

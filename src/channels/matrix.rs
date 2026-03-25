@@ -531,6 +531,7 @@ impl MatrixChannel {
             .unwrap_or_else(|_| "Usage data unavailable.".to_string())
     }
 
+    #[allow(clippy::format_push_string)]
     async fn fetch_oauth_usage() -> Option<String> {
         let token = Self::read_oauth_token().await?;
 
@@ -555,6 +556,7 @@ impl MatrixChannel {
         let data: serde_json::Value = resp.json().await.ok()?;
 
         let fmt_bar = |pct: f64| -> String {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let filled = ((pct / 100.0) * 20.0).round() as usize;
             let filled = filled.min(20);
             format!(
@@ -711,6 +713,7 @@ impl MatrixChannel {
             / 1_000_000.0
     }
 
+    #[allow(clippy::format_push_string)]
     fn aggregate_claude_code_usage() -> String {
         let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
             Ok(h) => std::path::PathBuf::from(h),
@@ -883,9 +886,7 @@ impl MatrixChannel {
                 week.messages += 1;
             }
 
-            let entry = model_map
-                .entry(rec.model.clone())
-                .or_insert_with(Bucket::default);
+            let entry = model_map.entry(rec.model.clone()).or_default();
             entry.input += rec.inp;
             entry.output += rec.out;
             entry.cache_read += rec.cr;
@@ -1093,7 +1094,7 @@ impl MatrixChannel {
                     reply_target: format!("{}||{}", sender, room_id),
                     content: body,
                     channel: "matrix".to_string(),
-                    timestamp: (ts / 1000) as u64,
+                    timestamp: (ts / 1000).max(0).cast_unsigned(),
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: vec![],
@@ -1943,6 +1944,7 @@ impl Channel for MatrixChannel {
         let http_client_for_handler = self.http_client.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_config_for_handler = self.transcription_config.clone();
+        let mcp_server_names_for_handler = self.mcp_server_names.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -2162,7 +2164,7 @@ impl Channel for MatrixChannel {
 
                 // Check for help/commands command (zero-token operation)
                 if MatrixChannel::is_help_command(&body) {
-                    let result = MatrixChannel::handle_help_command(&self.mcp_server_names);
+                    let result = MatrixChannel::handle_help_command(&mcp_server_names_for_handler);
                     send_zero_token!(result, "help");
                 }
 
